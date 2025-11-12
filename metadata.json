@@ -1,0 +1,5 @@
+{
+  "name": "Gerador de Memorial Hidrossanitário PRO",
+  "description": "Uma aplicação web completa para engenheiros civis gerarem memoriais descritivos e de cálculo para projetos hidrossanitários, de gás e de reúso de água, em conformidade com as normas ABNT. A ferramenta guia o usuário através de um processo passo a passo, desde a definição do tipo de edificação até a geração de relatórios detalhados em PDF e DOCX.",
+  "requestFramePermissions": []
+}
