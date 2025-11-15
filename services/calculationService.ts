@@ -1,4 +1,4 @@
-import { ProjectState, Module, Trecho, Caminho, TrechoGas, AguaFria, RamalVentilacao, CaminhoGas, Bomba } from '../types';
+import { ProjectState, Module, Trecho, Caminho, TrechoGas, AguaFria, RamalVentilacao, CaminhoGas, Bomba, Lixeira } from '../types';
 import { CONEXOES_AGUA_DB, APARELHOS_SANITARIOS_UHC, APARELHOS_PRESSAO_MINIMA, MANNING_COEFFICIENTS, AGUA_PROPRIEDADES, ELASTICIDADE_MODULOS, VENTILACAO_DIAMETROS, buildingTypes, CONDUTIVIDADE_TERMICA, TANQUES_COMERCIAIS, HIDROMETROS_DB, BOMBAS_ESGOTO_DB, DIMENSOES_ABRIGO_GAS, APARELHOS_DESCARGA_DB, tubulacoesDB, APARELHOS_PESOS } from '../constants';
 import { getDiametroInterno } from './utils';
 
@@ -7,7 +7,8 @@ const getPopulacao = (buildingType: string, buildingData: ProjectState['building
     return buildingData.pessoas;
   }
   if (buildingType === "Multifamiliar") {
-    return buildingData.pisos * buildingData.aptPorAndar * buildingData.pessoasPorApt;
+    const totalApts = buildingData.floorGroups.reduce((acc, group) => acc + ((Number(group.numFloors) || 0) * (Number(group.aptsPerFloor) || 0)), 0);
+    return totalApts * buildingData.pessoasPorApt;
   }
   return buildingData.pessoas;
 };
@@ -30,6 +31,8 @@ export const calculateModule = (module: Module, state: ProjectState, buildingTyp
             return calculateReuso(newModule, state, buildingTypeName);
         case 'Gás Combustível':
             return calculateGas(newModule, state);
+        case 'Lixeira':
+            return calculateLixeira(newModule, state, buildingTypeName);
     }
     return newModule;
 };
@@ -44,24 +47,64 @@ const calculateAguaFria = (module: Module, state: ProjectState, buildingType: st
 
     if(projectData.metodoConsumo === 'area') {
         consumoDiario = buildingData.areaTotal * projectData.consumoPorArea;
-        consumoStepDetail = `Fórmula: A × C<br>Substituição: ${buildingData.areaTotal.toFixed(2)} m² × ${projectData.consumoPorArea} L/m².dia = <b>${consumoDiario.toFixed(0)} L/dia</b>`;
+        consumoStepDetail = `
+            <p>O consumo diário foi calculado com base na área da edificação, conforme NBR 5626 para fins não residenciais.</p>
+            <p><strong>Fórmula:</strong> C = A × C<sub>A</sub></p>
+            <p><strong>Onde:</strong><br/>- C = Consumo diário (L/dia)<br/>- A = Área total (m²)<br/>- C<sub>A</sub> = Consumo por área (L/m².dia)</p>
+            <p><strong>Substituição:</strong> C = ${buildingData.areaTotal.toFixed(2)} m² × ${projectData.consumoPorArea} L/m².dia</p>
+            <p><strong>Resultado:</strong> Consumo Diário = <b>${consumoDiario.toFixed(0)} L/dia</b></p>
+        `;
     } else {
         consumoDiario = populacao * projectData.consumoPerCapita;
-        consumoStepDetail = `Fórmula: Pop. × C<br>Substituição: ${populacao} pessoas × ${projectData.consumoPerCapita} L/p.dia = <b>${consumoDiario.toFixed(0)} L/dia</b>`;
+        consumoStepDetail = `
+            <p>O consumo diário foi calculado com base na população estimada para a edificação, conforme NBR 5626 para fins residenciais.</p>
+            <p><strong>Fórmula:</strong> C = P × q</p>
+            <p><strong>Onde:</strong><br/>- C = Consumo diário (L/dia)<br/>- P = População (pessoas)<br/>- q = Consumo per capita (L/pessoa.dia)</p>
+            <p><strong>Substituição:</strong> C = ${populacao} pessoas × ${projectData.consumoPerCapita} L/pessoa.dia</p>
+            <p><strong>Resultado:</strong> Consumo Diário = <b>${consumoDiario.toFixed(0)} L/dia</b></p>
+        `;
     }
 
     const reservaConsumo = consumoDiario * projectData.diasReserva;
     const reservaIncendio = reservatorios.reservaIncendio || 0;
-    const volumeTotalReserva = reservaConsumo + reservaIncendio;
+    let volumeTotalReserva = 0;
+    let reservaSuperiorTotal = 0;
+    let reservaInferiorTotal = 0;
+    let detailDistrib = "";
+    let warning = "";
 
-    const reservaSuperiorTotal = volumeTotalReserva * (reservatorios.percentualSuperior / 100);
-    const reservaInferiorTotal = volumeTotalReserva - reservaSuperiorTotal;
-    const capacidadeSuperiorPorRes = reservaSuperiorTotal / reservatorios.numSuperiores;
-    const capacidadeInferiorPorRes = reservatorios.numInferiores > 0 ? reservaInferiorTotal / reservatorios.numInferiores : 0;
+    if (reservatorios.integracaoIncendio === 'integrada') {
+        volumeTotalReserva = reservaConsumo;
+        if (reservaConsumo < reservaIncendio) {
+            warning = `<br><b style='color: #ef4444;'>Atenção:</b> O volume de reserva de consumo (${reservaConsumo.toFixed(0)} L) é menor que a reserva de incêndio (${reservaIncendio} L). Recomenda-se aumentar os dias de reserva.`;
+        }
+        reservaSuperiorTotal = volumeTotalReserva * (reservatorios.percentualSuperior / 100);
+        reservaInferiorTotal = volumeTotalReserva - reservaSuperiorTotal;
+
+        detailDistrib = `Modo: <b>Integrada</b>. Volume Total (baseado no consumo): <b>${volumeTotalReserva.toFixed(0)} L</b><br>
+        Distribuição: ${reservatorios.percentualSuperior}% Superior (${reservaSuperiorTotal.toFixed(0)} L) / ${100 - reservatorios.percentualSuperior}% Inferior (${reservaInferiorTotal.toFixed(0)} L).<br>
+        <i>(RTI de ${reservaIncendio} L deve ser garantida dentro deste volume).</i>${warning}`;
+
+    } else { // 'somar'
+        volumeTotalReserva = reservaConsumo + reservaIncendio;
+        const reservaIncendioSuperior = reservaIncendio * (reservatorios.percentualIncendioSuperior / 100);
+        const reservaIncendioInferior = reservaIncendio - reservaIncendioSuperior;
+        const reservaConsumoSuperior = reservaConsumo * (reservatorios.percentualSuperior / 100);
+        const reservaConsumoInferior = reservaConsumo - reservaConsumoSuperior;
+        reservaSuperiorTotal = reservaConsumoSuperior + reservaIncendioSuperior;
+        reservaInferiorTotal = reservaConsumoInferior + reservaIncendioInferior;
+        
+        detailDistrib = `Modo: <b>Somar</b>. Volume Total (Consumo + Incêndio): <b>${volumeTotalReserva.toFixed(0)} L</b><br>
+        Distribuição do Consumo: ${reservatorios.percentualSuperior}% Superior (${reservaConsumoSuperior.toFixed(0)} L) e ${100 - reservatorios.percentualSuperior}% Inferior (${reservaConsumoInferior.toFixed(0)} L).<br>
+        Volume Superior Total: ${reservaConsumoSuperior.toFixed(0)} L (consumo) + ${reservaIncendioSuperior.toFixed(0)} L (RTI) = <b>${reservaSuperiorTotal.toFixed(0)} L</b><br>
+        Volume Inferior Total: ${reservaConsumoInferior.toFixed(0)} L (consumo) + ${reservaIncendioInferior.toFixed(0)} L (RTI) = <b>${reservaInferiorTotal.toFixed(0)} L</b>`;
+    }
+
+    const capacidadeSuperiorPorRes = reservaSuperiorTotal > 0 ? reservaSuperiorTotal / reservatorios.numSuperiores : 0;
+    const capacidadeInferiorPorRes = reservatorios.numInferiores > 0 && reservaInferiorTotal > 0 ? reservaInferiorTotal / reservatorios.numInferiores : 0;
     
     const findCommercialTank = (volume: number) => TANQUES_COMERCIAIS.find(v => v >= volume) || TANQUES_COMERCIAIS[TANQUES_COMERCIAIS.length - 1];
 
-    // Sugere um valor comercial se o usuário ainda não tiver escolhido um
     if(!state.reservatorios.volumeSuperiorComercial || state.reservatorios.volumeSuperiorComercial < capacidadeSuperiorPorRes) {
         state.reservatorios.volumeSuperiorComercial = findCommercialTank(capacidadeSuperiorPorRes);
     }
@@ -72,7 +115,7 @@ const calculateAguaFria = (module: Module, state: ProjectState, buildingType: st
     module.results.push(
         { label: "População de Cálculo", value: populacao, unit: "pessoas" },
         { label: "Consumo Diário Total", value: consumoDiario, unit: "L" },
-        { label: `Reserva Total (${projectData.diasReserva} dias + RTI)`, value: volumeTotalReserva, unit: "L" },
+        { label: `Reserva Total`, value: volumeTotalReserva, unit: "L" },
         { label: "Reserva Técnica Incêndio (RTI)", value: reservaIncendio, unit: "L"},
         { label: "Vol. Calculado Superior (por un.)", value: `${capacidadeSuperiorPorRes.toFixed(0)}`, unit: "L" },
         { label: "Vol. Calculado Inferior (por un.)", value: `${capacidadeInferiorPorRes.toFixed(0)}`, unit: "L" },
@@ -84,16 +127,16 @@ const calculateAguaFria = (module: Module, state: ProjectState, buildingType: st
       );
     }
     
-    const detailDistrib = `Volume Total: ${volumeTotalReserva.toFixed(0)} L<br>
-Percentual Superior: ${reservatorios.percentualSuperior}%<br>
-<b>Volume Superior:</b> ${reservaSuperiorTotal.toFixed(0)} L (${reservatorios.numSuperiores} un.) - Calculado: ${capacidadeSuperiorPorRes.toFixed(0)} L/un. - <b>Adotado: ${reservatorios.numSuperiores} x ${state.reservatorios.volumeSuperiorComercial} L</b><br>
-<b>Volume Inferior:</b> ${reservaInferiorTotal.toFixed(0)} L ${reservatorios.numInferiores > 0 ? `(${reservatorios.numInferiores} un.)` : ''} - Calculado: ${capacidadeInferiorPorRes.toFixed(0)} L/un.
-${reservatorios.numInferiores > 0 ? ` - <b>Adotado: ${reservatorios.numInferiores} x ${state.reservatorios.volumeInferiorComercial} L</b>` : ''}`;
+    const finalDetailDistrib = `${detailDistrib}<br><br>
+<b>Volume Superior Adotado:</b> ${reservatorios.numSuperiores} x ${state.reservatorios.volumeSuperiorComercial || 0} L = <b>${reservatorios.numSuperiores * (state.reservatorios.volumeSuperiorComercial || 0)} L</b><br>
+${reservatorios.numInferiores > 0 ? `<b>Volume Inferior Adotado:</b> ${reservatorios.numInferiores} x ${state.reservatorios.volumeInferiorComercial || 0} L = <b>${reservatorios.numInferiores * (state.reservatorios.volumeInferiorComercial || 0)} L</b>` : ''}`;
 
+    const reservaFormula = reservatorios.integracaoIncendio === 'somar' ? 'V<sub>T</sub> = (C × D) + RTI' : 'V<sub>T</sub> = C × D';
+    const reservaSubst = `(${consumoDiario.toFixed(0)} L/dia × ${projectData.diasReserva}) ${reservatorios.integracaoIncendio === 'somar' ? `+ ${reservaIncendio} L` : ''} = <b>${reservatorios.integracaoIncendio === 'somar' ? (reservaConsumo + reservaIncendio).toFixed(0) : reservaConsumo.toFixed(0)} L</b>`
     module.calculationSteps.push(
         { description: "Cálculo da Demanda de Água Diária", detail: consumoStepDetail},
-        { description: "Cálculo do Volume de Reserva Total (NBR 5626)", detail: `Fórmula: (Demanda × Dias de Reserva) + RTI<br>Substituição: (${consumoDiario.toFixed(0)} L/dia × ${projectData.diasReserva}) + ${reservaIncendio} L = <b>${volumeTotalReserva.toFixed(0)} L</b>`},
-        { description: "Distribuição do Volume de Reserva", detail: detailDistrib },
+        { description: "Cálculo do Volume de Reserva Total (NBR 5626)", detail: `<p>A reserva total deve garantir o abastecimento por um período determinado, além da reserva de incêndio, se aplicável.</p><p><strong>Fórmula:</strong> ${reservaFormula}</p><p><strong>Onde:</strong><br/>- V<sub>T</sub> = Volume Total (L)<br/>- C = Consumo diário (L/dia)<br/>- D = Dias de reserva<br/>- RTI = Reserva Técnica de Incêndio (L)</p><p><strong>Substituição:</strong> ${reservaSubst}</p>`},
+        { description: "Distribuição do Volume de Reserva", detail: `<p>O volume total é distribuído entre os reservatórios superior e inferior conforme percentual definido.</p><p>${finalDetailDistrib}</p>` },
     );
 
     if (reservatorios.numInferiores > 0) {
@@ -164,11 +207,11 @@ ${reservatorios.numInferiores > 0 ? ` - <b>Adotado: ${reservatorios.numInferiore
         }
 
          module.calculationSteps.push(
-            { description: `Cálculo da Vazão de Recalque (${horasFuncionamento}h)`, detail: `Fórmula: Q = V / t<br>Substituição: Q = ${consumoDiario.toFixed(0)} L / (${horasFuncionamento}h × 3600s/h) = <b>${vazaoRecalqueL_s.toFixed(2)} L/s</b>` },
-            { description: "Cálculo da Perda de Carga no Recalque (Hazen-Williams)", detail: `Fórmula: J = (10.67 × Q¹·⁸⁵²) / (C¹·⁸⁵² × D⁴·⁸⁷)<br>Comprimento Real: ${bombeamento.comprimentoReal} m<br>Comprimento Equivalente Peças: ${comprimentoEquivalente.toFixed(2)} m <ul>${pecasDetalhamento.join("")}</ul><b>Comprimento Total Virtual: ${comprimentoVirtual.toFixed(2)} m</b><br>Perda de Carga Unitária (J) = ${J_recalque.toFixed(5)} m/m <br><b>Perda de Carga Total (PD) = ${perdaCargaRecalque.toFixed(2)} mca</b>` },
-            { description: "Cálculo da Altura Manométrica Total (AMT)", detail: `Fórmula: AMT = H_geo + PD_recalque<br>Substituição: AMT = ${alturaGeometrica.toFixed(2)} + ${perdaCargaRecalque.toFixed(2)} = <b>${amt.toFixed(2)} mca</b>`},
-            { description: "Cálculo da Potência do Motor (CV)", detail: `Fórmula: Pot(CV) = (Q × AMT) / (75 × η)<br>Substituição: Pot = (${vazaoRecalqueL_s.toFixed(2)} L/s × ${amt.toFixed(2)} mca) / (75 × ${bombeamento.rendimento / 100}) = <b>${potenciaCV.toFixed(2)} CV</b>` },
-            { description: "Verificação de Cavitação (NPSH)", detail: `Fórmula: NPSHdisp = P_atm - H_sucção - P_vapor - PD_sucção<br>Substituição: NPSHdisp = ${pAtm} - ${bombeamento.alturaSuccao} - ${pVapor} - ${pdSuccao.toFixed(2)} = <b>${npshDisponivel.toFixed(2)} mca</b><br><i>*Verificar se NPSHdisp > NPSHreq (do fabricante).</i>` }
+            { description: `Cálculo da Vazão de Recalque (${horasFuncionamento}h)`, detail: `<p>A vazão é calculada para recalcar o volume diário no tempo de funcionamento especificado.</p><p><strong>Fórmula:</strong> Q = V / t</p><p><strong>Onde:</strong><br/>- Q = Vazão (L/s)<br/>- V = Volume Diário (L)<br/>- t = Tempo (s)</p><p><strong>Substituição:</strong> Q = ${consumoDiario.toFixed(0)} L / (${horasFuncionamento}h × 3600s/h) = <b>${vazaoRecalqueL_s.toFixed(2)} L/s</b></p>` },
+            { description: "Cálculo da Perda de Carga no Recalque (Hazen-Williams)", detail: `<p>A perda de carga é calculada considerando o atrito na tubulação (distribuída) e a passagem por conexões (localizada).</p><p><strong>Fórmula:</strong> PD = J × L<sub>virtual</sub></p><p><strong>Onde:</strong><br/>- PD = Perda de Carga (mca)<br/>- J = Perda de Carga Unitária (m/m)<br/>- L<sub>virtual</sub> = Comprimento Virtual (m)</p><p><strong>Detalhes:</strong><br/>Comprimento Real: ${bombeamento.comprimentoReal} m<br>Comprimento Equivalente Peças: ${comprimentoEquivalente.toFixed(2)} m <ul>${pecasDetalhamento.join("")}</ul><b>Comprimento Total Virtual: ${comprimentoVirtual.toFixed(2)} m</b><br>Perda de Carga Unitária (J) = ${J_recalque.toFixed(5)} m/m <br><b>Perda de Carga Total (PD) = ${perdaCargaRecalque.toFixed(2)} mca</b></p>` },
+            { description: "Cálculo da Altura Manométrica Total (AMT)", detail: `<p>A AMT representa a energia total que a bomba deve fornecer à água.</p><p><strong>Fórmula:</strong> AMT = H<sub>geo</sub> + PD<sub>recalque</sub></p><p><strong>Onde:</strong><br/>- AMT = Altura Manométrica Total (mca)<br/>- H<sub>geo</sub> = Altura Geométrica (m)<br/>- PD<sub>recalque</sub> = Perda de Carga (mca)</p><p><strong>Substituição:</strong> AMT = ${alturaGeometrica.toFixed(2)} + ${perdaCargaRecalque.toFixed(2)} = <b>${amt.toFixed(2)} mca</b></p>`},
+            { description: "Cálculo da Potência do Motor (CV)", detail: `<p>Cálculo da potência necessária para o motor da bomba.</p><p><strong>Fórmula:</strong> Pot(CV) = (Q × AMT) / (75 × η)</p><p><strong>Onde:</strong><br/>- Pot = Potência (CV)<br/>- Q = Vazão (L/s)<br/>- AMT = Altura Manométrica (mca)<br/>- η = Rendimento do conjunto (%)</p><p><strong>Substituição:</strong> Pot = (${vazaoRecalqueL_s.toFixed(2)} L/s × ${amt.toFixed(2)} mca) / (75 × ${bombeamento.rendimento / 100}) = <b>${potenciaCV.toFixed(2)} CV</b></p>` },
+            { description: "Verificação de Cavitação (NPSH)", detail: `<p>Verifica se a pressão na sucção da bomba está acima da pressão de vapor da água, evitando cavitação.</p><p><strong>Fórmula:</strong> NPSH<sub>disp</sub> = P<sub>atm</sub> - H<sub>sucção</sub> - P<sub>vapor</sub> - PD<sub>sucção</sub></p><p><strong>Onde:</strong><br/>- NPSH<sub>disp</sub> = Net Positive Suction Head Disponível (mca)<br/>- P<sub>atm</sub> = Pressão atmosférica local (mca)<br/>- H<sub>sucção</sub> = Altura de sucção (m)<br/>- P<sub>vapor</sub> = Pressão de vapor da água (mca)<br/>- PD<sub>sucção</sub> = Perda de carga na sucção (mca)</p><p><strong>Substituição:</strong> NPSH<sub>disp</sub> = ${pAtm} - ${bombeamento.alturaSuccao} - ${pVapor} - ${pdSuccao.toFixed(2)} = <b>${npshDisponivel.toFixed(2)} mca</b><br><i>*Verificar se NPSHdisp > NPSHreq (do fabricante).</i></p>` }
         );
 
         const K_agua = propsAgua.moduloElasticidade; 
@@ -192,7 +235,7 @@ ${reservatorios.numInferiores > 0 ? ` - <b>Adotado: ${reservatorios.numInferiore
         );
         module.calculationSteps.push({
             description: "Análise de Transiente Hidráulico (Golpe de Aríete)",
-            detail: `Fórmula (Joukowsky/Michaud): ΔH = f(a, L, V, t)<br>Celeridade da onda (a): ${celeridade.toFixed(2)} m/s<br>Tempo Crítico (2L/a): ${tempo_critico.toFixed(2)} s<br><b>Sobrepressão (ΔH): ${sobrepressao_mca.toFixed(2)} mca</b><br><b>Pressão Máxima (H_max): ${pressao_maxima.toFixed(2)} mca</b>`
+            detail: `<p>Análise da sobrepressão causada pelo fechamento de válvulas ou parada da bomba.</p><p><strong>Fórmula (Joukowsky/Michaud):</strong> ΔH = f(a, L, V, t)</p><p><strong>Onde:</strong><br/>- ΔH = Sobrepressão (mca)<br/>- a = Celeridade da onda (m/s)<br/>- L = Comprimento da tubulação (m)<br/>- V = Velocidade da água (m/s)<br/>- t = Tempo de fechamento (s)</p><p><strong>Resultados:</strong><br/>Celeridade da onda (a): ${celeridade.toFixed(2)} m/s<br>Tempo Crítico (2L/a): ${tempo_critico.toFixed(2)} s<br><b>Sobrepressão (ΔH): ${sobrepressao_mca.toFixed(2)} mca</b><br><b>Pressão Máxima (H_max): ${pressao_maxima.toFixed(2)} mca</b></p>`
         });
     }
 
@@ -499,9 +542,394 @@ const calculateAguaQuente = (module: Module, state: ProjectState, buildingType: 
     return module;
 };
 
+const calculateGordura = (module: Module, state: ProjectState, buildingTypeName: string): Module => {
+    const { gorduraData } = state;
+    let volumeCalculado = 0;
+    let calculoDetail = "";
+    let perApartmentNote = "";
+
+    if (buildingTypeName === "Multifamiliar" && gorduraData.tipoInstalacao === 'individual') {
+        volumeCalculado = 18; // Caixa Simples por apartamento
+        calculoDetail = `<p><strong>Critério (NBR 8160):</strong> Para cozinhas residenciais em unidades autônomas, adota-se Caixa de Gordura Simples (CS).</p>
+                         <p><strong>Volume Mínimo:</strong> 18 L</p>
+                         <p><strong>Resultado:</strong> Adotado <strong>1 Caixa de 18L por apartamento</strong>.</p>`;
+        perApartmentNote = " (por apartamento)";
+    } else if (["Unifamiliar", "Multifamiliar"].includes(buildingTypeName)) {
+        const numCozinhas = gorduraData.numeroCozinhas || 1;
+        let boxType = "", formula = "", subst = "";
+        if (numCozinhas === 1) {
+            volumeCalculado = 18;
+            boxType = "Simples (CS)";
+            formula = "Volume Mínimo (Tabela 3)";
+            subst = `Para 1 cozinha, volume tabelado = <b>18 L</b>`;
+        } else if (numCozinhas === 2) {
+            volumeCalculado = 31;
+            boxType = "Dupla (CD)";
+            formula = "Volume Mínimo (Tabela 3)";
+            subst = `Para 2 cozinhas, volume tabelado = <b>31 L</b>`;
+        } else {
+             volumeCalculado = 30 + 20 * (numCozinhas - 2);
+             boxType = "Especial (CE)";
+             formula = "V = 30 + 20 × (N - 2)";
+             subst = `V = 30 + 20 × (${numCozinhas} - 2) = <b>${volumeCalculado} L</b>`;
+        }
+        calculoDetail = `<p><strong>Critério (NBR 8160):</strong> Para ${numCozinhas} cozinha(s), adota-se Caixa de Gordura ${boxType}.</p>
+                         <p><strong>Fórmula:</strong> ${formula}</p>
+                         <p><strong>Substituição:</strong> ${subst}</p>
+                         <p><strong>Resultado:</strong> Volume calculado de <strong>${volumeCalculado} L</strong>.</p>`;
+    } else { // Comercial / Industrial
+        const numRefeicoes = gorduraData.numeroRefeicoes || 0;
+        volumeCalculado = 2 * numRefeicoes;
+        calculoDetail = `<p><strong>Critério (NBR 8160):</strong> Para cozinhas não residenciais, o volume é calculado com base no número de refeições diárias.</p>
+                         <p><strong>Fórmula:</strong> V = 2 × N</p>
+                         <p><strong>Onde:</strong><br/>- V = Volume (L)<br/>- N = Número de refeições</p>
+                         <p><strong>Substituição:</strong> V = 2 × ${numRefeicoes} = <b>${volumeCalculado} L</b></p>
+                         <p><strong>Resultado:</strong> Volume calculado de <strong>${volumeCalculado} L</strong>.</p>`;
+    }
+
+    // Dimensionamento do tubo de queda
+    const uhcTotalGordura = (gorduraData.numeroCozinhas || 1) * 2; // UHC=2 para pia de cozinha
+    const uhcPorTubo = gorduraData.numTubosQuedaGordura > 0 ? uhcTotalGordura / gorduraData.numTubosQuedaGordura : uhcTotalGordura;
+
+    const getDiametroTuboQuedaGordura = (uhc: number) => {
+        if (uhc <= 10) return 75;
+        if (uhc <= 160) return 100;
+        return 150;
+    };
+    const diametroTuboQuedaGordura = getDiametroTuboQuedaGordura(uhcPorTubo);
+
+    module.results.push(
+        { label: `Volume da Caixa de Gordura${perApartmentNote}`, value: volumeCalculado, unit: "L" },
+        { label: "Nº Tubos de Queda Gordura", value: gorduraData.numTubosQuedaGordura, unit: ""},
+        { label: "DN Tubo Queda Gordura", value: diametroTuboQuedaGordura, unit: "mm" }
+    );
+
+    module.calculationSteps.push(
+        { description: "Dimensionamento da Caixa de Gordura (NBR 8160)", detail: calculoDetail },
+        { description: "Dimensionamento do Tubo de Queda de Gordura", detail: `UHC por tubo de queda: ${uhcPorTubo.toFixed(2)}.<br>Conforme NBR 8160 (Tabela 5), para esta UHC, o diâmetro nominal mínimo do tubo de queda que recebe efluentes de pias de cozinha é de <b>${diametroTuboQuedaGordura} mm</b>.` }
+    );
+
+    return module;
+};
+
+const calculatePluvial = (module: Module, state: ProjectState): Module => {
+    const { drenagem, areasPluviais } = state;
+    const I = drenagem.intensidade;
+
+    const areaTotalCobertura = areasPluviais.reduce((acc, a) => acc + a.area, 0);
+    const vazaoTotal = (I * areaTotalCobertura) / 60000; // Q em L/s
+
+    module.results.push(
+        { label: "Área Total de Cobertura", value: areaTotalCobertura, unit: "m²" },
+        { label: "Vazão Total de Projeto", value: vazaoTotal.toFixed(2), unit: "L/s" },
+    );
+    module.calculationSteps.push(
+        { 
+            description: "Cálculo da Vazão de Projeto (NBR 10844)", 
+            detail: `<p>A vazão de projeto é a máxima vazão de chuva que o sistema deve ser capaz de escoar.</p>
+                     <p><strong>Fórmula:</strong> Q = (I × A) / 60000</p>
+                     <p><strong>Onde:</strong><br/>- Q = Vazão (L/s)<br/>- I = Intensidade pluviométrica (mm/h)<br/>- A = Área de contribuição (m²)</p>
+                     <p><strong>Substituição:</strong> Q = (${I} mm/h × ${areaTotalCobertura.toFixed(2)} m²) / 60000 = <b>${vazaoTotal.toFixed(2)} L/s</b></p>`
+        }
+    );
+
+    areasPluviais.forEach((area, index) => {
+        const Q_area = (I * area.area) / 60000;
+        const Q_por_tubo = area.tubosQueda > 0 ? Q_area / area.tubosQueda : 0;
+        
+        const getDiametroCondutorVertical = (q: number) => {
+            if (q <= 1.4) return 75;
+            if (q <= 4.5) return 100;
+            if (q <= 12) return 125;
+            if (q <= 20) return 150;
+            return 200;
+        };
+        const diametro = getDiametroCondutorVertical(Q_por_tubo);
+        module.results.push(
+            { label: `DN Condutor Vertical (Área ${index+1})`, value: diametro, unit: "mm" }
+        );
+        module.calculationSteps.push(
+             { 
+                description: `Dimensionamento Condutor Vertical (Área ${index+1})`, 
+                detail: `<p><strong>Critério:</strong> O diâmetro do condutor vertical é selecionado da Tabela 1 da NBR 10844 com base na vazão por tubo.</p>
+                         <p><strong>Dados:</strong><br/>- Vazão na área: ${Q_area.toFixed(2)} L/s<br/>- Vazão por condutor (${area.tubosQueda} un.): ${Q_por_tubo.toFixed(2)} L/s</p>
+                         <p><strong>Resultado:</strong> Diâmetro mínimo adotado = <b>${diametro} mm</b>.</p>`
+             }
+        );
+    });
+
+    const n_manning = MANNING_COEFFICIENTS[drenagem.materialCalha] || 0.011;
+    const S = drenagem.declividadeCalha / 100;
+    
+    let A_molhada=0, P_molhado=0, RH=0, V=0, Q_calha_ls=0;
+    let calhaDetail = "";
+
+    if (drenagem.tipoCalha === 'retangular') {
+        A_molhada = drenagem.larguraCalha * drenagem.alturaCalha;
+        P_molhado = drenagem.larguraCalha + 2 * drenagem.alturaCalha;
+    } else if (drenagem.tipoCalha === 'semicircular') {
+        const raio = drenagem.diametroCalha / 2;
+        A_molhada = (Math.PI * Math.pow(raio, 2)) / 2;
+        P_molhado = Math.PI * raio;
+    } else { // trapezoidal
+        const z = 1; 
+        A_molhada = (drenagem.larguraCalha + drenagem.baseMenorCalha) / 2 * drenagem.alturaCalha;
+        P_molhado = drenagem.baseMenorCalha + 2 * drenagem.alturaCalha * Math.sqrt(1 + z*z);
+    }
+    
+    if (P_molhado > 0) {
+        RH = A_molhada / P_molhado;
+        V = (1/n_manning) * Math.pow(RH, 2/3) * Math.pow(S, 1/2);
+        Q_calha_ls = V * A_molhada * 1000;
+    }
+
+    module.results.push(
+        { label: "Vazão Máxima da Calha", value: Q_calha_ls.toFixed(2), unit: "L/s" }
+    );
+     module.calculationSteps.push(
+        { 
+            description: `Dimensionamento da Calha (${drenagem.tipoCalha})`, 
+            detail: `<p>A capacidade de escoamento da calha é calculada pela Equação de Manning.</p>
+                     <p><strong>Fórmula:</strong> Q = A × (1/n) × R<sub>h</sub><sup>2/3</sup> × S<sup>1/2</sup></p>
+                     <p><strong>Onde:</strong><br/>- Q = Vazão (m³/s)<br/>- A = Área molhada (m²)<br/>- n = Coef. de Manning<br/>- R<sub>h</sub> = Raio hidráulico (m)<br/>- S = Declividade (m/m)</p>
+                     <p><strong>Cálculo:</strong><br/>- Área Molhada: ${A_molhada.toFixed(4)} m²<br/>- Perímetro Molhado: ${P_molhado.toFixed(4)} m<br/>- Velocidade: ${V.toFixed(2)} m/s</p>
+                     <p><strong>Resultado:</strong> Capacidade de Vazão = <b>${Q_calha_ls.toFixed(2)} L/s</b></p>`
+        }
+    );
+    
+    drenagem.coletores.forEach((coletor) => {
+        const vazao = (I * coletor.areaServida) / 60000; // L/s
+        coletor.vazao = vazao;
+        const D = coletor.diametro / 1000;
+        if (D > 0) {
+            const S_col = coletor.declividade / 100;
+            const A_col = Math.PI * D*D / 4;
+            const RH_col = D/4;
+            const V_col = (1/0.009) * Math.pow(RH_col, 2/3) * Math.pow(S_col, 1/2);
+            coletor.velocidade = vazao > 0 ? (vazao/1000) / A_col : 0;
+            coletor.autolimpante = coletor.velocidade >= 0.6;
+        }
+    });
+
+    return module;
+};
+
+const calculateReuso = (module: Module, state: ProjectState, buildingTypeName: string): Module => {
+    const { reusoPluvial, buildingData } = state;
+
+    const volCaptadoAnual = reusoPluvial.precipitacaoMedia / 1000 * reusoPluvial.areaCaptacao * reusoPluvial.coeficienteRunoff * (reusoPluvial.eficienciaFiltro / 100); // m³
+    
+    let volReservatorio = 0;
+    if (reusoPluvial.metodoDimensionamentoReservatorio === 'automatico') {
+        volReservatorio = reusoPluvial.demandaNaoPotavel * reusoPluvial.periodoArmazenamento;
+    } else {
+        volReservatorio = reusoPluvial.volumeReservatorioAdotado;
+    }
+    
+    const volUtilizadoAnual = Math.min(reusoPluvial.demandaNaoPotavel * 365, volCaptadoAnual * 1000); // L
+    const economiaAnual = (volUtilizadoAnual / 1000) * reusoPluvial.custoAguaPotavel;
+
+    const populacao = getPopulacao(buildingTypeName, buildingData);
+    const consumoTotalPotavelDiario = populacao * state.projectData.consumoPerCapita;
+    const reducaoConsumo = (consumoTotalPotavelDiario + reusoPluvial.demandaNaoPotavel) > 0 ? (reusoPluvial.demandaNaoPotavel / (consumoTotalPotavelDiario + reusoPluvial.demandaNaoPotavel)) * 100 : 0;
+    
+    // Financial Analysis - Payback
+    const CUSTO_SISTEMA_REUSO_POR_LITRO = 2.0; // R$/L - Custo estimado para reservatório, bomba, filtro, etc.
+    const custoInvestimento = volReservatorio * CUSTO_SISTEMA_REUSO_POR_LITRO;
+    const custoManutencaoAnual = reusoPluvial.manutencaoAnual;
+    const lucroLiquidoAnual = economiaAnual - custoManutencaoAnual;
+    const payback = (lucroLiquidoAnual > 0) ? custoInvestimento / lucroLiquidoAnual : Infinity;
+
+    // Update state directly (side effect, following existing pattern)
+    state.reusoPluvial.volumeCaptado = volCaptadoAnual * 1000;
+    state.reusoPluvial.volumeReservatorio = volReservatorio;
+    state.reusoPluvial.economiaAnual = economiaAnual;
+    state.reusoPluvial.payback = payback;
+    state.reusoPluvial.reducaoConsumo = reducaoConsumo;
+
+    module.results.push(
+        { label: "Volume Anual Captado", value: (volCaptadoAnual * 1000).toFixed(0), unit: "L" },
+        { label: "Volume de Reservatório", value: volReservatorio, unit: "L" },
+        { label: "Economia Anual Estimada", value: economiaAnual.toFixed(2), unit: "R$" },
+        { label: "Redução no Consumo de Água", value: reducaoConsumo.toFixed(1), unit: "%" },
+        { label: "Payback Simples", value: isFinite(payback) ? payback.toFixed(1) : "Nunca", unit: "anos" }
+    );
+
+    module.calculationSteps.push(
+        { description: "Potencial de Captação Anual (NBR 15527)", detail: `Fórmula: V = P × A × C × η<br>Substituição: V = ${reusoPluvial.precipitacaoMedia}mm × ${reusoPluvial.areaCaptacao}m² × ${reusoPluvial.coeficienteRunoff} × ${reusoPluvial.eficienciaFiltro/100} = <b>${(volCaptadoAnual*1000).toFixed(0)} L/ano</b>`},
+        { description: "Dimensionamento do Reservatório", detail: `Com base na demanda diária (${reusoPluvial.demandaNaoPotavel} L) e período de armazenamento (${reusoPluvial.periodoArmazenamento} dias), o volume adotado é de <b>${volReservatorio} L</b>.`},
+        { description: "Análise de Viabilidade Econômica", detail: `Volume anual aproveitado: ${volUtilizadoAnual.toFixed(0)} L.<br>
+            Custo da água: R$ ${reusoPluvial.custoAguaPotavel}/m³.<br><b>Economia Anual Bruta: R$ ${economiaAnual.toFixed(2)}</b>.<br>
+            Custo de Investimento Estimado: R$ ${custoInvestimento.toFixed(2)}.<br>
+            Custo de Manutenção Anual: R$ ${custoManutencaoAnual.toFixed(2)}.<br>
+            <b>Payback Simples: ${isFinite(payback) ? payback.toFixed(1) + ' anos' : 'Não se paga'}</b>.`
+        }
+    );
+    
+    return module;
+};
+
+const calculateGas = (module: Module, state: ProjectState): Module => {
+    const { gas } = state;
+
+    const DENSIDADE_RELATIVA = gas.tipo === 'glp' ? 1.55 : 0.6;
+    const PODER_CALORIFICO = gas.tipo === 'glp' ? 24000 : 8600; // kcal/m³
+    const PRESSAO_SAIDA_MBAR = gas.pressaoSaida * 1000;
+
+    const calculatedCaminhos = gas.caminhos.map((caminho): CaminhoGas => {
+        let perdaAcumulada = 0;
+        let potenciaAcumulada = 0;
+
+        const trechosReversed = [...caminho.trechos].reverse();
+        const calculatedTrechosReversed = trechosReversed.map(trecho => {
+             potenciaAcumulada += trecho.potencia;
+             const vazao_kW = potenciaAcumulada;
+             const vazao_kcal_h = vazao_kW * 860.421;
+             const vazao_m3_h = PODER_CALORIFICO > 0 ? vazao_kcal_h / PODER_CALORIFICO : 0;
+             const Q = vazao_m3_h;
+
+             const K = 26.9;
+             const L = trecho.comprimento * 1.2;
+             const H_max = PRESSAO_SAIDA_MBAR * 0.1;
+             const totalLength = caminho.trechos.reduce((s, t) => s + t.comprimento, 0);
+             const H_trecho_max = totalLength > 0 ? H_max * (trecho.comprimento / totalLength) : H_max;
+
+             const D_cm = H_trecho_max > 0 ? Math.pow((Math.pow(Q, 2) * DENSIDADE_RELATIVA * L) / (Math.pow(K, 2) * H_trecho_max), 1/5) : 0;
+             const D_mm = D_cm * 10;
+             
+             const diâmetrosDisponiveis = [15, 22, 28, 35, 42, 54];
+             const diametroAdotado = diâmetrosDisponiveis.find(d => d * 0.9 > D_mm) || diâmetrosDisponiveis[diâmetrosDisponiveis.length - 1];
+
+             const D_adotado_cm = (diametroAdotado * 0.9) / 10;
+             const perdaCarga = D_adotado_cm > 0 ? (Math.pow(Q, 2) * DENSIDADE_RELATIVA * L) / (Math.pow(K, 2) * Math.pow(D_adotado_cm, 5)) : 0;
+             perdaAcumulada += perdaCarga;
+
+             return { ...trecho, potenciaAcumulada, vazao: Q, diametro: diametroAdotado, perdaCarga: perdaCarga, perdaCargaAcumulada: 0 };
+        });
+        
+        const calculatedTrechos = calculatedTrechosReversed.reverse();
+        let perdaAcumuladaFinal = 0;
+        calculatedTrechos.forEach(t => {
+            perdaAcumuladaFinal += t.perdaCarga || 0;
+            t.perdaCargaAcumulada = perdaAcumuladaFinal;
+        });
+
+        return { ...caminho, trechos: calculatedTrechos, perdaTotal: perdaAcumuladaFinal };
+    });
+    
+    module.caminhosGas = calculatedCaminhos;
+    const maxPerda = Math.max(...calculatedCaminhos.map(c => c.perdaTotal || 0));
+    const perdaAdmissivel = PRESSAO_SAIDA_MBAR * 0.1;
+
+    module.results.push(
+        { label: "Perda de Carga Máxima", value: maxPerda.toFixed(3), unit: "mbar" },
+        { label: "Perda Admissível", value: perdaAdmissivel.toFixed(3), unit: "mbar" }
+    );
+    
+    module.calculationSteps.push({
+        description: "Dimensionamento da Tubulação de Gás (Fórmula de Pole)",
+        detail: `<p>O diâmetro de cada trecho foi calculado para atender à vazão exigida, limitando a perda de carga total a 10% da pressão de saída (${perdaAdmissivel.toFixed(3)} mbar). A fórmula de Pole foi utilizada:</p>
+                 <p><strong>Fórmula:</strong> D<sup>5</sup> = (Q<sup>2</sup> × d × L) / (K<sup>2</sup> × ΔP)</p>
+                 <p><strong>Onde:</strong><br/>
+                 - D = Diâmetro interno do tubo (cm)<br/>
+                 - Q = Vazão de gás (m³/h)<br/>
+                 - d = Densidade relativa do gás (GLP: ${DENSIDADE_RELATIVA}, GN: 0.6)<br/>
+                 - L = Comprimento equivalente do trecho (m)<br/>
+                 - K = Constante (26.9 para GLP/GN)<br/>
+                 - ΔP = Perda de carga no trecho (mbar)</p>
+                 <p>Para cada trecho, o diâmetro comercial imediatamente superior ao calculado foi adotado, e a perda de carga foi verificada.</p>`
+    });
+
+    let keyAbrigo = '';
+    if (gas.tipo === 'gn') {
+        keyAbrigo = 'central_gn';
+    } else if (gas.tipoCilindro && gas.numCilindros) {
+        keyAbrigo = `${gas.numCilindros}x${gas.tipoCilindro}`;
+    }
+    const abrigoInfo = DIMENSOES_ABRIGO_GAS[keyAbrigo];
+    if (abrigoInfo) {
+        gas.abrigo = abrigoInfo;
+        module.results.push(
+            { label: "Dimensões do Abrigo", value: abrigoInfo.dimensoes, unit: ""},
+            { label: "Ventilação do Abrigo", value: abrigoInfo.ventilacao, unit: ""}
+        );
+    }
+
+    return module;
+};
+
+const calculateLixeira = (module: Module, state: ProjectState, buildingTypeName: string): Module => {
+    const { lixeira, buildingData } = state;
+    const populacao = getPopulacao(buildingTypeName, buildingData);
+    
+    const volumeTotalDiario = populacao * lixeira.contribuicaoDiaria;
+    const volumeTotalAcumulado = volumeTotalDiario * lixeira.frequenciaColeta * lixeira.taxaAcumulacao;
+    
+    let volOrganico = 0;
+    let volReciclavel = 0;
+
+    if (lixeira.tipoColeta === 'seletiva') {
+        volOrganico = volumeTotalAcumulado * 0.5;
+        volReciclavel = volumeTotalAcumulado * 0.5;
+    } else {
+        volOrganico = volumeTotalAcumulado;
+    }
+
+    const alturaEmpilhamento = 1.0; // m
+    const areaOrganico = (volOrganico / 1000) / alturaEmpilhamento;
+    const areaReciclavel = (volReciclavel / 1000) / alturaEmpilhamento;
+    const areaTotal = areaOrganico + areaReciclavel;
+    
+    const numContentores240L = volumeTotalAcumulado > 0 ? Math.ceil(volumeTotalAcumulado / 240) : 0;
+    const numContentores1000L = volumeTotalAcumulado > 0 ? Math.ceil(volumeTotalAcumulado / 1000) : 0;
+
+    module.results.push(
+        { label: "População de Cálculo", value: populacao, unit: "pessoas" },
+        { label: "Volume Total Acumulado", value: volumeTotalAcumulado.toFixed(0), unit: "L" },
+        { label: "Volume Orgânico/Rejeito", value: volOrganico.toFixed(0), unit: "L" },
+        { label: "Volume Reciclável", value: volReciclavel.toFixed(0), unit: "L" },
+        { label: "Área Mínima do Abrigo", value: areaTotal.toFixed(2), unit: "m²" },
+        { label: "Sugestão de Contentores (240L)", value: numContentores240L, unit: "un." },
+        { label: "Sugestão de Contentores (1000L)", value: numContentores1000L, unit: "un." }
+    );
+
+    let contentoresDetail = '';
+    if (lixeira.tipoColeta === 'seletiva') {
+        const numOrg240 = Math.ceil(volOrganico / 240);
+        const numRec240 = Math.ceil(volReciclavel / 240);
+        const numOrg1000 = Math.ceil(volOrganico / 1000);
+        const numRec1000 = Math.ceil(volReciclavel / 1000);
+        contentoresDetail = `<p>O dimensionamento considera a separação entre resíduos orgânicos/rejeitos e recicláveis.</p>
+        <p><strong>Para contentores de 240 L:</strong><br/>
+        - Orgânico: ${volOrganico.toFixed(0)} L / 240 L/un. = ${numOrg240} un.<br/>
+        - Reciclável: ${volReciclavel.toFixed(0)} L / 240 L/un. = ${numRec240} un.<br/>
+        - <b>Total: ${numOrg240 + numRec240} unidades de 240 L.</b></p>
+        <p><strong>Para contentores de 1000 L:</strong><br/>
+        - Orgânico: ${volOrganico.toFixed(0)} L / 1000 L/un. = ${numOrg1000} un.<br/>
+        - Reciclável: ${volReciclavel.toFixed(0)} L / 1000 L/un. = ${numRec1000} un.<br/>
+        - <b>Total: ${numOrg1000 + numRec1000} unidades de 1000 L.</b></p>`;
+    } else {
+        contentoresDetail = `<p>O dimensionamento considera o volume total de resíduos.</p>
+        <p><strong>Para contentores de 240 L:</strong><br/>
+        - Total: ${volumeTotalAcumulado.toFixed(0)} L / 240 L/un. = <b>${numContentores240L} unidades</b>.</p>
+        <p><strong>Para contentores de 1000 L:</strong><br/>
+        - Total: ${volumeTotalAcumulado.toFixed(0)} L / 1000 L/un. = <b>${numContentores1000L} unidades</b>.</p>`;
+    }
+
+    module.calculationSteps.push(
+        { description: "Cálculo do Volume Diário de Resíduos", detail: `Fórmula: Vd = Pop. × C<br>Substituição: Vd = ${populacao}p × ${lixeira.contribuicaoDiaria} L/p.dia = <b>${volumeTotalDiario.toFixed(0)} L/dia</b>`},
+        { description: "Cálculo do Volume Total Acumulado", detail: `Fórmula: Vt = Vd × f × Ta<br>Substituição: Vt = ${volumeTotalDiario.toFixed(0)} × ${lixeira.frequenciaColeta} dias × ${lixeira.taxaAcumulacao} = <b>${volumeTotalAcumulado.toFixed(0)} L</b>`},
+        { description: "Cálculo da Área do Abrigo", detail: `Considerando altura de empilhamento de ${alturaEmpilhamento.toFixed(2)} m.<br>Área Orgânico: ${(volOrganico/1000).toFixed(2)} m²<br>Área Reciclável: ${(volReciclavel/1000).toFixed(2)} m²<br><b>Área Total: ${areaTotal.toFixed(2)} m²</b>`},
+        { description: "Dimensionamento dos Contentores", detail: contentoresDetail }
+    );
+
+    return module;
+};
+
+
 const calculateEsgoto = (module: Module, state: ProjectState, buildingType: string): Module => {
     const { buildingData, esgotoItens, esgotoSanitario, esgotoTratamento, projectData } = state;
-    const numUnidades = buildingType === "Multifamiliar" ? buildingData.pisos * buildingData.aptPorAndar : 1;
+    const numUnidades = buildingType === "Multifamiliar" ? buildingData.floorGroups.reduce((acc, g) => acc + ((Number(g.numFloors) || 0) * (Number(g.aptsPerFloor) || 0)), 0) : 1;
     
     let totalUHC = 0;
     let vazaoEsgotoTotal = 0;
@@ -518,423 +946,146 @@ const calculateEsgoto = (module: Module, state: ProjectState, buildingType: stri
         const totalUD = esgotoItens.reduce((acc, item) => acc + item.quantidade * (APARELHOS_DESCARGA_DB[item.aparelho] || 0), 0) * numUnidades;
         const C = 0.14; // Coeficiente para apartamentos
         vazaoEsgotoTotal = C * Math.sqrt(totalUD);
-        calculoVazaoDetail = `<strong>Método Probabilístico (Hunter-Russo)</strong><br>Fórmula: Q = C × √ΣUD<br>Substituição: Q = ${C} × √(${totalUD.toFixed(2)}) = <b>${vazaoEsgotoTotal.toFixed(2)} L/s</b>`;
-        module.results.push({ label: "Soma Unidades de Descarga", value: totalUD.toFixed(2), unit: "UD" });
-    } else { // UHC
-        const uhcPorUnidade = esgotoItens.reduce((acc, item) => acc + item.quantidade * (APARELHOS_SANITARIOS_UHC[item.aparelho] || 0), 0);
-        totalUHC = uhcPorUnidade * numUnidades;
-        vazaoEsgotoTotal = 0.3 * Math.sqrt(totalUHC);
-        const uhcList = esgotoItens.map(item => `<li>${item.quantidade} x ${item.aparelho} (${APARELHOS_SANITARIOS_UHC[item.aparelho]} UHC) = ${item.quantidade * (APARELHOS_SANITARIOS_UHC[item.aparelho] || 0)} UHC</li>`).join("");
-        let uhcDetail = `<strong>UHC por Unidade: ${uhcPorUnidade}</strong><ul>${uhcList}</ul>`;
-        if (buildingType === "Multifamiliar") {
-          uhcDetail += `<strong>UHC Total:</strong> ${uhcPorUnidade} UHC/unidade × ${numUnidades} unidades = <strong>${totalUHC} UHC</strong>`;
-        }
-        calculoVazaoDetail = `<strong>Método UHC</strong><br>${uhcDetail}<br>Fórmula: Q = 0,3 × √UHC<br>Substituição: Q = 0,3 × √(${totalUHC}) = <b>${vazaoEsgotoTotal.toFixed(2)} L/s</b>`;
-        module.results.push({ label: "Soma de UHC Total", value: totalUHC, unit: "UHC" });
+        calculoVazaoDetail = `<strong>Método Probabilístico (Comercial/Industrial)</strong><br>
+Fórmula: Q = C × √ΣUD<br>Substituição: Q = ${C} × √${totalUD.toFixed(2)} = <b>${vazaoEsgotoTotal.toFixed(2)} L/s</b>`;
+    } else { // uhc
+        totalUHC = esgotoItens.reduce((acc, item) => acc + item.quantidade * (APARELHOS_SANITARIOS_UHC[item.aparelho] || 0), 0) * numUnidades;
+        const Q = 0.3 * Math.sqrt(totalUHC);
+        vazaoEsgotoTotal = Q;
+        calculoVazaoDetail = `<strong>Método UHC (Residencial)</strong><br>
+Fórmula: Q = 0.3 × √ΣUHC<br>Substituição: Q = 0.3 × √${totalUHC} = <b>${vazaoEsgotoTotal.toFixed(2)} L/s</b>`;
     }
     
-    const vazaoEsgotoColuna = vazaoEsgotoTotal / esgotoSanitario.numTubosQueda;
+    // Dimensionamento do Tubo de Queda
+    const uhcPorPrumada = totalUHC / esgotoSanitario.numTubosQueda;
+    const getDiametroTuboQueda = (uhc: number) => {
+        if (uhc <= 10) return 75;
+        if (uhc <= 160) return 100;
+        if (uhc <= 500) return 150;
+        return 200;
+    };
+    const diametroTuboQueda = getDiametroTuboQueda(uhcPorPrumada);
     
-    let dimColuna = getDiametroEsgoto(vazaoEsgotoColuna);
-    if(esgotoItens.some(i => i.aparelho.includes("Bacia")) && dimColuna.diametro < 100) {
-        dimColuna = getDiametroEsgoto(6.0); // Força 100mm se tiver bacia
-    }
-    let dimColetor = getDiametroEsgoto(vazaoEsgotoTotal);
-    if (dimColetor.diametro < 100 && totalUHC > 0) dimColetor = getDiametroEsgoto(6.0);
-    
-    const numPavimentos = buildingType === "Multifamiliar" ? buildingData.pisos : buildingData.pavimentos;
-    const uhcPorColunaVentilacao = totalUHC / (esgotoSanitario.numColunasVentilacao || 1);
-    
-    // NBR 8160 - Tabela 7: Diâmetros para Coluna de Ventilação
-    let diametroVentilacao = 75;
-    if (uhcPorColunaVentilacao > 180 || numPavimentos > 10) diametroVentilacao = 100;
-    else if (uhcPorColunaVentilacao > 30) diametroVentilacao = 75;
-    else if (uhcPorColunaVentilacao > 10) diametroVentilacao = 50;
-    else diametroVentilacao = 40;
-
-    // A coluna de ventilação não pode ser menor que o tubo de queda que ela ventila.
-    // Para corrigir o cálculo, comparamos com um tubo de queda equivalente à carga da ventilação.
-    const vazaoPorColunaVentilacao = vazaoEsgotoTotal / (esgotoSanitario.numColunasVentilacao || 1);
-    const diametroTuboQuedaEquivalente = getDiametroEsgoto(vazaoPorColunaVentilacao).diametro;
-    if(diametroTuboQuedaEquivalente > diametroVentilacao) {
-        diametroVentilacao = diametroTuboQuedaEquivalente;
-    }
-
-    esgotoSanitario.ramaisVentilacao.forEach((ramal: RamalVentilacao) => {
-        ramal.diametro = VENTILACAO_DIAMETROS(ramal.uhc, ramal.comprimento);
-        module.results.push({ label: `Ramal Vent. '${ramal.descricao}'`, value: ramal.diametro, unit: "mm" });
-    });
+    // Dimensionamento do Coletor Predial
+    const { diametro: diametroColetor, declividade: declividadeColetor } = getDiametroEsgoto(vazaoEsgotoTotal);
 
     module.results.push(
-        { label: `Diâmetro Tubo de Queda (${esgotoSanitario.numTubosQueda} un.)`, value: dimColuna.diametro, unit: `mm` },
-        { label: `Diâmetro Coluna Ventilação (${esgotoSanitario.numColunasVentilacao} un.)`, value: diametroVentilacao, unit: "mm" },
-        { label: "Diâmetro Coletor Predial", value: dimColetor.diametro, unit: `mm (decl. ${dimColetor.declividade})` }
+        { label: "Total UHC (ou ΣUD)", value: esgotoSanitario.metodoCalculo === 'uhc' ? totalUHC : (esgotoItens.reduce((acc, item) => acc + item.quantidade * (APARELHOS_DESCARGA_DB[item.aparelho] || 0), 0) * numUnidades).toFixed(2), unit: "" },
+        { label: "Vazão de Esgoto", value: vazaoEsgotoTotal.toFixed(2), unit: "L/s" },
+        { label: "DN Tubo de Queda", value: diametroTuboQueda, unit: `mm (${esgotoSanitario.numTubosQueda} un.)` },
+        { label: "DN Coletor Predial", value: diametroColetor, unit: "mm" },
+        { label: "Declividade Coletor", value: declividadeColetor, unit: "" }
     );
     
-    const sugestoes: string[] = [];
-    sugestoes.push("Instalar caixa de inspeção no início do coletor predial.");
-    const numCaixasDistancia = Math.floor(esgotoSanitario.comprimentoColetor / 25);
-    if (numCaixasDistancia > 0) {
-        sugestoes.push(`Instalar ${numCaixasDistancia} caixa(s) de inspeção ao longo do coletor para atender ao espaçamento máximo de 25m.`);
-    }
-    if ((esgotoSanitario.numCurvas90 || 0) > 0 || (esgotoSanitario.numCurvas45 || 0) > 0) {
-        sugestoes.push("Instalar caixas de inspeção em todas as mudanças de direção (curvas).");
-    }
-    sugestoes.push("Instalar caixa de inspeção na junção com o coletor público ou sistema de tratamento.");
-    esgotoSanitario.sugestoesInspecao = sugestoes;
-
-    module.results.push({ label: "Caixas de Inspeção", value: `~${sugestoes.length}`, unit: "unidades" });
-
     module.calculationSteps.push(
-      { description: "Cálculo da Vazão de Esgoto", detail: calculoVazaoDetail },
-      { description: "Dimensionamento da Coluna de Esgoto", detail: `Vazão por coluna: ${vazaoEsgotoColuna.toFixed(2)} L/s.<br>Para esta vazão, adota-se DN <b>${dimColuna.diametro}mm</b> (NBR 8160).`},
-      { description: "Dimensionamento da Coluna de Ventilação", detail: `UHC por coluna de ventilação: ${uhcPorColunaVentilacao.toFixed(2)} UHC. Baseado neste valor e em ${numPavimentos} pavimentos, adota-se DN <b>${diametroVentilacao}mm</b> (NBR 8160).`},
-      { description: "Recomendação de Caixas de Inspeção (NBR 8160)", detail: `<ul>${sugestoes.map(s => `<li>${s}</li>`).join('')}</ul>` }
+        { description: "Cálculo da Vazão de Esgoto (NBR 8160)", detail: calculoVazaoDetail },
+        { description: "Dimensionamento dos Tubos de Queda", detail: `UHC por prumada: ${uhcPorPrumada.toFixed(2)}<br>Com base na NBR 8160 (Tabela 5), o diâmetro mínimo é <b>${diametroTuboQueda} mm</b>.` },
+        { description: "Dimensionamento do Coletor Predial", detail: `Vazão: ${vazaoEsgotoTotal.toFixed(2)} L/s<br>Com base na NBR 8160 (Tabela 6), o diâmetro mínimo é <b>${diametroColetor} mm</b> com declividade de <b>${declividadeColetor}</b>.` }
     );
-     esgotoSanitario.ramaisVentilacao.forEach((ramal) => {
-        module.calculationSteps.push({ description: `Dimensionamento do Ramal de Ventilação '${ramal.descricao}'`, detail: `Para ${ramal.uhc} UHC e comprimento de ${ramal.comprimento}m, adota-se DN <b>${ramal.diametro}mm</b> (NBR 8160, Tabela 8).`});
+    
+    // Dimensionamento da Ventilação
+    const totalUHCVentilacao = totalUHC / esgotoSanitario.numColunasVentilacao;
+    const getDiametroVentilacao = (uhc: number) => {
+        if (uhc <= 16) return 50;
+        if (uhc <= 80) return 75;
+        return 100;
+    };
+    const diametroVentilacao = getDiametroVentilacao(totalUHCVentilacao);
+    esgotoSanitario.diametroVentilacao = diametroVentilacao;
+    
+    module.results.push({ label: "DN Coluna de Ventilação", value: diametroVentilacao, unit: `mm (${esgotoSanitario.numColunasVentilacao} un.)` });
+    module.calculationSteps.push({ description: "Dimensionamento da Coluna de Ventilação", detail: `UHC por coluna: ${totalUHCVentilacao.toFixed(2)}<br>Com base na NBR 8160 (Tabela 7), o diâmetro mínimo é <b>${diametroVentilacao} mm</b>.`});
+    
+    esgotoSanitario.ramaisVentilacao.forEach(ramal => {
+        ramal.diametro = VENTILACAO_DIAMETROS(ramal.uhc, ramal.comprimento);
     });
+    
+    // Elevatória de Esgoto
+    if(esgotoSanitario.elevatoria?.habilitado) {
+        const populacaoElevatoria = getPopulacao(buildingType, buildingData);
+        const contribuicaoDiaria = populacaoElevatoria * (projectData.consumoPerCapita * 0.8); // 80% do consumo de água
+        const vazaoElevatoria = (contribuicaoDiaria / (24 * 3600)) * 2; // Fator de pico
+        const volumePoco = contribuicaoDiaria / 4; // 1/4 da contribuição diária
+        const amtElevatoria = esgotoSanitario.elevatoria.alturaRecalque + 5; // Simplicado
+        
+        const bombaSugerida = BOMBAS_ESGOTO_DB.find(b => b.vazao_max_ls >= vazaoElevatoria && b.amt_max >= amtElevatoria);
+        
+        esgotoSanitario.elevatoria.volumePocoCalculado = volumePoco;
+        esgotoSanitario.elevatoria.bombaSugerida = bombaSugerida?.nome;
+        
+        module.results.push({ label: "Volume Poço Elevatória", value: volumePoco.toFixed(0), unit: "L" });
+        module.results.push({ label: "Bomba de Esgoto Sugerida", value: bombaSugerida?.nome || "Não encontrada", unit: "" });
+        module.calculationSteps.push({ description: "Dimensionamento da Elevatória de Esgoto", detail: `Vazão: ${vazaoElevatoria.toFixed(2)} L/s, AMT: ${amtElevatoria.toFixed(2)} mca. Poço: ${volumePoco.toFixed(0)} L. Bomba sugerida: <b>${bombaSugerida?.nome || "Não encontrada"}</b>` });
+    }
 
     if (esgotoTratamento.habilitado) {
         const N = getPopulacao(buildingType, buildingData);
-        const C = esgotoTratamento.contribuicaoEsgoto;
-        const T_limpeza_anos = Math.max(1, Math.min(5, Math.round(esgotoTratamento.intervaloLimpeza)));
-        const K_tabela = { 1: 94, 2: 134, 3: 174, 4: 214, 5: 254 } as const;
-        const K = K_tabela[T_limpeza_anos as keyof typeof K_tabela] || 94;
-        
-        // Fossa Séptica (NBR 7229)
-        const T_detencao_dias = C <= 100 ? 1.0 : Math.max(0.5, 1 - 0.0004 * (C - 100));
-        const volumeUtilFossaTotal = 1000 + N * (C * T_detencao_dias + K);
-        const vFossaUnitario = volumeUtilFossaTotal / esgotoTratamento.numFossas;
-        const vFossaUnitarioM3 = vFossaUnitario / 1000;
-        
-        const hFossa = Math.min(Math.max(1.2, vFossaUnitarioM3 * 0.4), 2.2); 
-        const areaFossa = vFossaUnitarioM3 / hFossa;
-        const wFossa = Math.max(0.8, Math.sqrt(areaFossa / 2));
-        const lFossa = Math.max(1.0, 2 * wFossa);
-
-        esgotoTratamento.fossaComprimento = lFossa; esgotoTratamento.fossaLargura = wFossa; esgotoTratamento.fossaProfundidadeUtil = hFossa;
-        module.results.push({ label: `Volume Útil Fossa Séptica (${esgotoTratamento.numFossas} un.)`, value: (volumeUtilFossaTotal/1000).toFixed(2), unit: "m³" });
-        module.results.push({ label: `Dimensões Fossa (${esgotoTratamento.numFossas} un.)`, value: `${lFossa.toFixed(2)}x${wFossa.toFixed(2)}x${hFossa.toFixed(2)}`, unit: "m (CxLxH)" });
-
-        // Filtro Anaeróbio (NBR 13969)
-        const volumeUtilFiltroTotal = 1.6 * N * C;
-        const vFiltroUnitario = volumeUtilFiltroTotal / esgotoTratamento.numFiltros;
-        const vFiltroUnitarioM3 = vFiltroUnitario / 1000;
-        const hFiltro = Math.max(1.2, vFiltroUnitarioM3 * 0.5);
-        const areaFiltro = vFiltroUnitarioM3 / hFiltro;
-        const dFiltro = Math.sqrt(4 * areaFiltro / Math.PI);
-        
-        esgotoTratamento.filtroDiametro = dFiltro; esgotoTratamento.filtroAlturaUtil = hFiltro;
-        module.results.push({ label: `Volume Útil Filtro Anaeróbio (${esgotoTratamento.numFiltros} un.)`, value: (volumeUtilFiltroTotal/1000).toFixed(2), unit: "m³" });
-        module.results.push({ label: `Dimensões Filtro (${esgotoTratamento.numFiltros} un.)`, value: `Ø${dFiltro.toFixed(2)} x ${hFiltro.toFixed(2)}`, unit: "m (DxH)" });
-        
-        // Disposição Final (NBR 13969)
-        const contribuicaoTotalDiaria = N * C;
-        const areaInfiltracao = esgotoTratamento.taxaInfiltracao > 0 ? contribuicaoTotalDiaria / esgotoTratamento.taxaInfiltracao : 0;
-        
-        let infiltracaoCalcDetail = `<strong>Dimensionamento Disposição Final (NBR 13969)</strong><br>Fórmula (Área de Infiltração Necessária): A = (N × C) / Ta<br>
-            <u>Onde:</u><br>A: Área de infiltração (m²)<br>N: Número de contribuintes (${N} pessoas)<br>C: Contribuição diária de esgoto (${C} L/p.dia)<br>Ta: Taxa de aplicação diária (${esgotoTratamento.taxaInfiltracao} L/m².dia)<br>
-            <u>Substituição:</u><br>A = (${N} × ${C}) / ${esgotoTratamento.taxaInfiltracao} = <b>${areaInfiltracao.toFixed(2)} m²</b> total.`;
-        
-        if (esgotoTratamento.tipoDisposicaoFinal === 'valaInfiltracao') {
-            const L_vala = areaInfiltracao / (esgotoTratamento.valaLargura || 0.5);
-            module.results.push({ label: "Comp. Vala de Infiltração", value: L_vala.toFixed(2), unit: "m" });
-            infiltracaoCalcDetail += `<br><br><strong>Dimensionamento da Vala de Infiltração:</strong><br>Fórmula: L = A / Largura<br>
-            <u>Onde:</u><br>L: Comprimento da vala (m)<br>A: Área de infiltração (${areaInfiltracao.toFixed(2)} m²)<br>Largura: Largura da vala (${esgotoTratamento.valaLargura || 0.5} m)<br>
-            <u>Substituição:</u><br>L = ${areaInfiltracao.toFixed(2)} / ${esgotoTratamento.valaLargura || 0.5} = <b>${L_vala.toFixed(2)} m</b>`;
-        } else { // Sumidouro
-             const areaSumidouroUnit = areaInfiltracao / esgotoTratamento.numSumidouros; 
-             const dSumidouro = 1.5; // Adotando diâmetro padrão
-             const areaFundo = (Math.PI * Math.pow(dSumidouro, 2)) / 4;
-             let hSumidouro = 0;
-             let sumidouroDimDetail = "";
-
-             if (areaSumidouroUnit <= areaFundo) {
-                 hSumidouro = 1.0; // Adotar altura mínima
-                 sumidouroDimDetail = `A área do fundo (<b>${areaFundo.toFixed(2)} m²</b>) já atende à área necessária de <b>${areaSumidouroUnit.toFixed(2)} m²</b>. Adotou-se altura útil mínima de <b>1.00 m</b>.`;
-             } else {
-                 const areaLateralNecessaria = areaSumidouroUnit - areaFundo;
-                 hSumidouro = areaLateralNecessaria / (Math.PI * dSumidouro);
-                 sumidouroDimDetail = `Fórmula: h = (A_total - A_fundo) / (π × D)<br>
-                 <u>Onde:</u><br>h: Altura útil do sumidouro (m)<br>A_total: Área de infiltração por unidade (${areaSumidouroUnit.toFixed(2)} m²)<br>A_fundo: Área do fundo do sumidouro (${areaFundo.toFixed(2)} m²)<br>D: Diâmetro do sumidouro (${dSumidouro} m)<br>
-                 <u>Substituição:</u><br>h = (${areaSumidouroUnit.toFixed(2)} - ${areaFundo.toFixed(2)}) / (π × ${dSumidouro}) = <b>${hSumidouro.toFixed(2)} m</b>`;
-             }
-             
-             esgotoTratamento.sumidouroDiametro = dSumidouro; esgotoTratamento.sumidouroAlturaUtil = hSumidouro;
-             module.results.push({ label: `Área Infiltração Necessária`, value: areaInfiltracao.toFixed(2), unit: "m²" });
-             module.results.push({ label: `Dim. Sumidouro (${esgotoTratamento.numSumidouros} un.)`, value: `Ø${dSumidouro.toFixed(2)} x ${hSumidouro.toFixed(2)}`, unit: "m (DxH)" });
-             infiltracaoCalcDetail += `<br><br><strong>Dimensionamento do Sumidouro (${esgotoTratamento.numSumidouros} unidade(s)):</strong><br>Área por unidade: ${areaSumidouroUnit.toFixed(2)} m².<br>Diâmetro adotado: ${dSumidouro} m.<br>${sumidouroDimDetail}`;
-        }
-        if(esgotoTratamento.leitoSecagem?.habilitado) {
-            const areaLeito = N * 0.08;
-            module.results.push({ label: "Área Leito de Secagem", value: areaLeito.toFixed(2), unit: "m²"});
-        }
-        
-        const fossaCalcDetail = `<strong>Dimensionamento Fossa Séptica (NBR 7229)</strong><br>Fórmula: V = 1000 + N × (C × T + K)<br><u>Onde:</u><br>V: Volume útil (L)<br>N: Número de contribuintes (${N} pessoas)<br>C: Contribuição diária de esgoto (${C} L/pessoa.dia)<br>T: Período de detenção (${T_detencao_dias.toFixed(2)} dias)<br>K: Taxa de acúmulo de lodo (${K} L/pessoa para limpeza em ${T_limpeza_anos} ano(s))<br><u>Substituição:</u><br>V = 1000 + ${N} × (${C} × ${T_detencao_dias.toFixed(2)} + ${K}) = <b>${volumeUtilFossaTotal.toFixed(0)} L</b> total (para <b>${esgotoTratamento.numFossas}</b> unidade(s)).`;
-        
-        const fossaDimDetail = `Com base no volume útil de <b>${(vFossaUnitario/1000).toFixed(2)} m³</b> por unidade e nas proporções da NBR 7229 (L ≈ 2W, 1.2m ≤ H ≤ 2.2m), as dimensões internas adotadas são:<br>
-        <b>Comprimento: ${lFossa.toFixed(2)} m, Largura: ${wFossa.toFixed(2)} m, Altura útil: ${hFossa.toFixed(2)} m</b>`;
+        const C = esgotoTratamento.contribuicaoEsgoto; // L/p.dia
+        const T = esgotoTratamento.intervaloLimpeza; // anos
+        const K = 94; // Taxa de acumulação de lodo (L/p.ano), para T=1 ano, Temp > 20C.
+        const Lf = 1; // Fator de lodo fresco
     
-        const filtroCalcDetail = `<strong>Dimensionamento Filtro Anaeróbio (NBR 13969)</strong><br>Fórmula: V = 1.6 × N × C<br><u>Onde:</u><br>V: Volume útil do leito filtrante (L)<br>N: Número de contribuintes (${N} pessoas)<br>C: Contribuição diária de esgoto (${C} L/p.dia)<br><u>Substituição:</u><br>V = 1.6 × ${N} × ${C} = <b>${volumeUtilFiltroTotal.toFixed(0)} L</b> total (para <b>${esgotoTratamento.numFiltros}</b> unidade(s)).`;
-
-        const filtroDimDetail = `Com base no volume útil de <b>${(vFiltroUnitario/1000).toFixed(2)} m³</b> por unidade e altura útil mínima de 1.2m (NBR 13969), as dimensões internas adotadas são:<br>
-        <b>Diâmetro: ${dFiltro.toFixed(2)} m, Altura Útil: ${hFiltro.toFixed(2)} m</b>`;
-
+        // Fossa Séptica (NBR 7229)
+        const volumeUtilFossaTotal = (1000 + N * (C * T + K * Lf)) / 1000; // m³
+        const volumePorFossa = esgotoTratamento.numFossas > 0 ? volumeUtilFossaTotal / esgotoTratamento.numFossas : 0;
+        const hFossa = 1.5; // Profundidade útil adotada (m)
+        const larguraFossa = Math.max(0.8, Math.sqrt(volumePorFossa / (2 * hFossa))); // L=2W
+        const comprimentoFossa = 2 * larguraFossa;
+        esgotoTratamento.fossaComprimento = Number(comprimentoFossa.toFixed(2));
+        esgotoTratamento.fossaLargura = Number(larguraFossa.toFixed(2));
+        esgotoTratamento.fossaProfundidadeUtil = hFossa;
+    
+        // Filtro Anaeróbio (NBR 13969)
+        const volumeUtilFiltroTotal = (1.6 * N * C) / 1000; // m³
+        const volumePorFiltro = esgotoTratamento.numFiltros > 0 ? volumeUtilFiltroTotal / esgotoTratamento.numFiltros : 0;
+        const hFiltro = 1.2; // Altura útil do leito filtrante (m)
+        const diametroFiltro = Math.sqrt((4 * volumePorFiltro) / (Math.PI * hFiltro));
+        esgotoTratamento.filtroDiametro = Number(diametroFiltro.toFixed(2));
+        esgotoTratamento.filtroAlturaUtil = hFiltro;
+    
+        // Sumidouro (NBR 7229 / NBR 13969)
+        const areaInfiltracaoTotal = esgotoTratamento.taxaInfiltracao > 0 ? (N * C) / esgotoTratamento.taxaInfiltracao : 0; // m²
+        const areaPorSumidouro = esgotoTratamento.numSumidouros > 0 ? areaInfiltracaoTotal / esgotoTratamento.numSumidouros : 0;
+        const diametroSumidouro = Math.sqrt(areaPorSumidouro / (1.75 * Math.PI)); // A = 1.75 * PI * D^2 for h=1.5D
+        const alturaSumidouro = 1.5 * diametroSumidouro;
+        esgotoTratamento.sumidouroDiametro = Number(diametroSumidouro.toFixed(2));
+        esgotoTratamento.sumidouroAlturaUtil = Number(alturaSumidouro.toFixed(2));
+    
+        module.results.push(
+            { label: "Volume Útil Total (Fossa)", value: volumeUtilFossaTotal.toFixed(2), unit: "m³" },
+            { label: "Dimensões Fossa (por un.)", value: `${comprimentoFossa.toFixed(2)}x${larguraFossa.toFixed(2)}x${hFossa.toFixed(2)}`, unit: "m" },
+            { label: "Volume Útil Total (Filtro)", value: volumeUtilFiltroTotal.toFixed(2), unit: "m³" },
+            { label: "Dimensões Filtro (por un.)", value: `Ø${diametroFiltro.toFixed(2)} x ${hFiltro.toFixed(2)}`, unit: "m" },
+            { label: "Área Infiltração Total", value: areaInfiltracaoTotal.toFixed(2), unit: "m²" },
+            { label: "Dimensões Sumidouro (por un.)", value: `Ø${diametroSumidouro.toFixed(2)} x ${alturaSumidouro.toFixed(2)}`, unit: "m" }
+        );
+    
         module.calculationSteps.push(
-            { description: "Cálculo do Volume da Fossa Séptica", detail: fossaCalcDetail },
-            { description: "Dimensionamento Físico da Fossa Séptica", detail: fossaDimDetail },
-            { description: "Cálculo do Volume do Filtro Anaeróbio", detail: filtroCalcDetail },
-            { description: "Dimensionamento Físico do Filtro Anaeróbio", detail: filtroDimDetail },
-            { description: "Dimensionamento da Disposição Final", detail: infiltracaoCalcDetail }
+            {
+                description: "Dimensionamento da Fossa Séptica (NBR 7229)",
+                detail: `<p><strong>Fórmula (Volume):</strong> V = 1000 + N × (C×T + K×Lf)</p>
+                         <p><strong>Onde:</strong><br/>- V = Volume útil (L)<br/>- N = População (pessoas)<br/>- C = Contribuição de esgoto (L/p.dia)<br/>- T = Período de Limpeza (anos)<br/>- K = Taxa de acumulação de lodo (L/p.ano)<br/>- Lf = Fator de lodo fresco</p>
+                         <p><strong>Substituição:</strong> V = 1000 + ${N} × (${C}×${T} + ${K}×${Lf}) = <b>${(volumeUtilFossaTotal*1000).toFixed(0)} L</b></p>
+                         <p><strong>Resultado:</strong><br/>- Volume por unidade (${esgotoTratamento.numFossas} un.): <b>${(volumePorFossa*1000).toFixed(0)} L</b><br/>
+                         - Dimensões Adotadas (L=2W, h=${hFossa}m): <b>${comprimentoFossa.toFixed(2)}m (C) x ${larguraFossa.toFixed(2)}m (L) x ${hFossa.toFixed(2)}m (h)</b></p>`
+            },
+            {
+                description: "Dimensionamento do Filtro Anaeróbio (NBR 13969)",
+                detail: `<p><strong>Fórmula (Volume):</strong> V = 1.6 × N × C</p>
+                         <p><strong>Onde:</strong><br/>- V = Volume útil (L)<br/>- N = População (pessoas)<br/>- C = Contribuição de esgoto (L/p.dia)</p>
+                         <p><strong>Substituição:</strong> V = 1.6 × ${N} × ${C} = <b>${(volumeUtilFiltroTotal*1000).toFixed(0)} L</b></p>
+                         <p><strong>Resultado:</strong><br/>- Volume por unidade (${esgotoTratamento.numFiltros} un.): <b>${(volumePorFiltro*1000).toFixed(0)} L</b><br/>
+                         - Dimensões Adotadas (h=${hFiltro}m): <b>Ø${diametroFiltro.toFixed(2)}m x ${hFiltro.toFixed(2)}m (h)</b></p>`
+            },
+            {
+                description: `Dimensionamento do ${esgotoTratamento.tipoDisposicaoFinal === 'sumidouro' ? 'Sumidouro' : 'Vala de Infiltração'} (NBR 13969)`,
+                detail: `<p><strong>Fórmula (Área):</strong> A = (N × C) / Ta</p>
+                         <p><strong>Onde:</strong><br/>- A = Área de infiltração (m²)<br/>- N = População (pessoas)<br/>- C = Contribuição de esgoto (L/p.dia)<br/>- Ta = Taxa de infiltração (L/m².dia)</p>
+                         <p><strong>Substituição:</strong> A = (${N} × ${C}) / ${esgotoTratamento.taxaInfiltracao} = <b>${areaInfiltracaoTotal.toFixed(2)} m²</b></p>
+                         <p><strong>Resultado:</strong><br/>- Área por unidade (${esgotoTratamento.numSumidouros} un.): <b>${areaPorSumidouro.toFixed(2)} m²</b><br/>
+                         - Dimensões Adotadas (h=1.5D): <b>Ø${diametroSumidouro.toFixed(2)}m x ${alturaSumidouro.toFixed(2)}m (h)</b></p>`
+            }
         );
     }
-    
-    if(esgotoSanitario.elevatoria?.habilitado) {
-        const elev = esgotoSanitario.elevatoria;
-        const vazaoBomba_ls = vazaoEsgotoTotal > 0.5 ? vazaoEsgotoTotal : 0.5; // Minimum flow
-        const tempoCicloMin = 5; // minutes
-        const volumeUtilPoco = (vazaoBomba_ls * 1000 * tempoCicloMin * 60) / (4 * 1000); // in Liters
-        elev.volumePocoCalculado = volumeUtilPoco;
-        
-        // Simplified head calculation
-        const amtBomba = elev.alturaRecalque + (elev.comprimentoRecalque * 0.05); // 5% friction loss
-        
-        const bombaSugerida = BOMBAS_ESGOTO_DB.find(b => b.vazao_max_ls > vazaoBomba_ls && b.amt_max > amtBomba);
-        elev.bombaSugerida = bombaSugerida ? bombaSugerida.nome : "Nenhum modelo compatível";
-        
-        module.results.push({ label: "Volume Útil Poço Elevatório", value: volumeUtilPoco.toFixed(0), unit: "L" });
-        module.results.push({ label: "Bomba Esgoto Sugerida", value: elev.bombaSugerida, unit: "" });
-        module.calculationSteps.push({ description: "Dimensionamento da Elevatória de Esgoto", detail: `Para uma vazão de <b>${vazaoBomba_ls.toFixed(2)} L/s</b> e um tempo de ciclo de ${tempoCicloMin} min, o volume útil do poço é de <b>${volumeUtilPoco.toFixed(0)} L</b>. Para uma AMT de ~<b>${amtBomba.toFixed(2)} mca</b>, a bomba sugerida é <b>${elev.bombaSugerida}</b>.`});
-    }
-
     return module;
-};
-
-const calculateGordura = (module: Module, state: ProjectState, buildingType: string): Module => {
-    const { buildingData, gorduraData } = state;
-    let volumeMin = 0;
-    let tipoCaixa = '';
-    let diametroTuboGordura = 75;
-
-    const getDiametroEsgoto = (q: number) => {
-        if (q <= 1.8) return { diametro: 75, declividade: "2,0%" };
-        if (q <= 6.0) return { diametro: 100, declividade: "1,0%" };
-        return { diametro: 100, declividade: "1,0%" };
-    };
-
-    if (["Unifamiliar", "Multifamiliar"].includes(buildingType)) {
-        const cozinhas = buildingType === "Multifamiliar" ? buildingData.pisos * buildingData.aptPorAndar * gorduraData.numeroCozinhas : gorduraData.numeroCozinhas;
-        
-        // Dimensionamento da Caixa de Gordura (com base no total de cozinhas)
-        if (cozinhas >= 2 && cozinhas <= 12) { tipoCaixa = "Dupla (CD)"; volumeMin = 31; }
-        else if (cozinhas > 12) { tipoCaixa = "Especial (CE)"; volumeMin = 120; }
-        else { tipoCaixa = "Simples (CS)"; volumeMin = 18; }
-        module.results.push({ label: "Nº de Cozinhas", value: cozinhas, unit: "" }, { label: "Tipo de Caixa", value: tipoCaixa, unit: "" }, { label: "Volume Mínimo", value: volumeMin, unit: "L" });
-        module.calculationSteps.push({ description: "Dimensionamento da Caixa de Gordura (NBR 8160)", detail: `Para ${cozinhas} cozinha(s), recomenda-se <b>${tipoCaixa}</b> com volume útil mínimo de <b>${volumeMin} L</b>. A caixa é dimensionada para a carga total.`});
-        
-        // Dimensionamento do Tubo de Queda (com base na carga dividida)
-        const uhcTotalGordura = cozinhas * (APARELHOS_SANITARIOS_UHC["Pia de Cozinha"] || 2);
-        const uhcPorTubo = uhcTotalGordura / (gorduraData.numTubosQuedaGordura || 1);
-        const vazaoPorTubo = 0.3 * Math.sqrt(uhcPorTubo);
-        diametroTuboGordura = Math.max(75, getDiametroEsgoto(vazaoPorTubo).diametro);
-        module.calculationSteps.push({ description: "Dimensionamento do Tubo de Queda de Gordura", detail: `UHC total de gordura: ${uhcTotalGordura}.<br>UHC por tubo de queda: ${uhcPorTubo.toFixed(2)}.<br>Vazão por tubo: ${vazaoPorTubo.toFixed(2)} L/s.<br>Adota-se DN <b>${diametroTuboGordura}mm</b> (mínimo 75mm).`});
-
-    } else { 
-        // Lógica para Comercial/Industrial
-        const N = gorduraData.numeroRefeicoes;
-        volumeMin = 2 * N + 20;
-        tipoCaixa = "Especial (CE)";
-        module.results.push({ label: "Nº de Refeições/dia (N)", value: N, unit: "" }, { label: "Tipo de Caixa de Gordura", value: tipoCaixa, unit: "" }, { label: "Volume Útil Calculado", value: volumeMin, unit: "L" });
-        module.calculationSteps.push({ description: "Dimensionamento Não Residencial (NBR 8160)", detail: `Fórmula: V = 2 × N + 20<br>Substituição: V = 2 × ${N} + 20 = <b>${volumeMin.toLocaleString("pt-BR")} L</b>` });
-        
-        // Para cozinhas não residenciais, o diâmetro mínimo é geralmente maior e não se baseia em UHC.
-        diametroTuboGordura = 100;
-        module.calculationSteps.push({ description: "Dimensionamento do Tubo de Queda de Gordura", detail: `Para a caixa de gordura tipo <b>${tipoCaixa}</b> (uso não residencial), o diâmetro mínimo recomendado para o tubo de queda é de <b>DN ${diametroTuboGordura}mm</b>, conforme NBR 8160.`});
-    }
-
-    module.results.push({ label: `Diâmetro Tubo Queda Gordura (${gorduraData.numTubosQuedaGordura} un.)`, value: diametroTuboGordura, unit: "mm" });
-    return module;
-};
-
-
-const calculatePluvial = (module: Module, state: ProjectState): Module => {
-    const { areasPluviais, drenagem } = state;
-    const getDiametroPluvial = (vazao: number) => { if (vazao <= 2.22) return 75; if (vazao <= 6.84) return 100; if (vazao <= 12.5) return 125; if (vazao <= 21) return 150; return 200; };
-    let areaTotal = 0; let vazaoTotal = 0;
-
-    areasPluviais.forEach((area, index) => {
-        areaTotal += area.area;
-        const vazaoArea = (drenagem.intensidade * area.area) / 3600;
-        vazaoTotal += vazaoArea;
-        const vazaoPorTubo = area.tubosQueda > 0 ? vazaoArea / area.tubosQueda : 0;
-        const diametro = getDiametroPluvial(vazaoPorTubo);
-        module.results.push({ label: `Área ${index + 1} - Condutor`, value: `${diametro} mm`, unit: `(${area.tubosQueda} un.)` });
-        module.calculationSteps.push({ description: `Cálculo da Área ${index + 1} (NBR 10844)`, detail: `Fórmula: Q = (I×A)/3600<br>Substituição: Q = (${drenagem.intensidade}×${area.area})/3600 = <b>${vazaoArea.toFixed(2)} L/s</b>.<br>Vazão por condutor: ${vazaoPorTubo.toFixed(2)} L/s.<br>Diâmetro Adotado: <b>${diametro} mm</b>` });
-        
-    });
-    
-    let areaSecao = 0, perimetroMolhado = 0;
-    switch(drenagem.tipoCalha) {
-        case 'semicircular': const r = drenagem.diametroCalha / 2; areaSecao = (Math.PI * r * r) / 2; perimetroMolhado = Math.PI * r; break;
-        case 'trapezoidal': const { larguraCalha: B, baseMenorCalha: b, alturaCalha: h } = drenagem; areaSecao = ((B + b) / 2) * h; const ladoInclinado = Math.sqrt(Math.pow((B - b) / 2, 2) + Math.pow(h, 2)); perimetroMolhado = b + 2 * ladoInclinado; break;
-        case 'retangular': default: areaSecao = drenagem.larguraCalha * drenagem.alturaCalha; perimetroMolhado = drenagem.larguraCalha + 2 * drenagem.alturaCalha; break;
-    }
-    if(areaSecao > 0 && perimetroMolhado > 0) {
-        const n = MANNING_COEFFICIENTS[drenagem.materialCalha] || 0.011; const raioHidraulico = areaSecao / perimetroMolhado; const declividade = drenagem.declividadeCalha / 100;
-        const capacidadeCalha = (areaSecao * Math.pow(raioHidraulico, 2/3) * Math.pow(declividade, 1/2)) / n;
-        const capacidadeCalhaL_s = capacidadeCalha * 1000;
-        const statusCalha = capacidadeCalhaL_s > vazaoTotal ? `OK` : `SUBDIMENSIONADA`;
-        module.results.push({ label: "Capacidade da Calha", value: capacidadeCalhaL_s.toFixed(2), unit: "L/s" }, { label: "Status da Calha", value: statusCalha, unit: "" });
-        module.calculationSteps.push({ description: "Verificação da Calha (Manning)", detail: `Fórmula: Q = (A × R^(2/3) × S^(1/2)) / n<br>Substituição: Q = (${areaSecao.toFixed(3)} × ${raioHidraulico.toFixed(3)}^(2/3) × ${declividade}^(1/2)) / ${n} = <b>${capacidadeCalhaL_s.toFixed(2)} L/s</b>` });
-    }
-    
-    drenagem.coletores.forEach(coletor => {
-        coletor.vazao = (drenagem.intensidade * coletor.areaServida) / 3600; // L/s
-        const Q = coletor.vazao / 1000; // m³/s
-        const D = coletor.diametro / 1000; // m
-        const S = coletor.declividade / 100;
-        const n_manning = MANNING_COEFFICIENTS['pvc'];
-
-        // Iterative solver for water depth (y)
-        let y = D / 2; // Initial guess
-        for (let i = 0; i < 10; i++) { // 10 iterations are enough
-            const theta = 2 * Math.acos(1 - 2 * y / D);
-            const A = (D*D/8) * (theta - Math.sin(theta));
-            const P = D * theta / 2;
-            const Rh = A / P;
-            const Q_calc = (1/n_manning) * A * Math.pow(Rh, 2/3) * Math.pow(S, 1/2);
-            y = y * Math.pow(Q / Q_calc, 0.4); // Adjust guess
-        }
-        
-        const A_final = (D*D/8) * (2 * Math.acos(1 - 2*y/D) - Math.sin(2 * Math.acos(1 - 2*y/D)));
-        const P_final = D * Math.acos(1 - 2*y/D);
-        const Rh_final = A_final / P_final;
-
-        coletor.laminaAgua = y * 1000; // mm
-        coletor.velocidade = Q / A_final; // m/s
-        coletor.tensaoArrasto = 1000 * 9.81 * Rh_final * S; // Pa
-        coletor.autolimpante = coletor.tensaoArrasto >= 1.0;
-        
-        module.results.push({ label: `Coletor '${coletor.descricao}' - Lâmina`, value: coletor.laminaAgua.toFixed(1), unit: `mm (${(coletor.laminaAgua/coletor.diametro*100).toFixed(0)}%)` });
-        module.results.push({ label: `Coletor '${coletor.descricao}' - Velocidade`, value: coletor.velocidade.toFixed(2), unit: "m/s" });
-        module.results.push({ label: `Coletor '${coletor.descricao}' - Autolimpeza`, value: coletor.autolimpante ? 'OK' : 'Verificar', unit: `(${coletor.tensaoArrasto.toFixed(2)} Pa)` });
-    });
-    
-    if(drenagem.tanqueRetencao.habilitado) {
-        const V = (drenagem.intensidade * drenagem.tanqueRetencao.tempoChuva * areaTotal) / 60000;
-        module.results.push({ label: "Volume Tanque de Retenção", value: V.toFixed(2), unit: "m³" });
-        module.calculationSteps.push({ description: "Dimensionamento do Tanque de Retenção", detail: `Fórmula: V = (I×T×A)/60000<br>Substituição: V = (${drenagem.intensidade}×${drenagem.tanqueRetencao.tempoChuva}×${areaTotal})/60000 = <b>${V.toFixed(2)} m³</b>`});
-    }
-
-    return module;
-};
-
-const calculateReuso = (module: Module, state: ProjectState, buildingTypeName: string): Module => {
-    const { reusoPluvial, projectData, buildingData } = state;
-    const populacao = getPopulacao(buildingTypeName, buildingData);
-    const consumoTotalAnual = (populacao * projectData.consumoPerCapita) * 365;
-
-    const volumeCaptadoAnual = (reusoPluvial.precipitacaoMedia / 1000) * reusoPluvial.areaCaptacao * reusoPluvial.coeficienteRunoff * (reusoPluvial.eficienciaFiltro / 100);
-    const demandaNaoPotavelAnual = reusoPluvial.demandaNaoPotavel * 365;
-    const volumeUtilizadoAnual = Math.min(volumeCaptadoAnual * 1000, demandaNaoPotavelAnual); // em Litros
-
-    let volumeReservatorioFinal = 0;
-    let periodoArmazenamentoFinal = reusoPluvial.periodoArmazenamento;
-    let calculoReservatorioDetail = "";
-
-    if (reusoPluvial.metodoDimensionamentoReservatorio === 'manual' && reusoPluvial.volumeReservatorioAdotado > 0) {
-        volumeReservatorioFinal = reusoPluvial.volumeReservatorioAdotado;
-        if(reusoPluvial.demandaNaoPotavel > 0) {
-            periodoArmazenamentoFinal = volumeReservatorioFinal / reusoPluvial.demandaNaoPotavel;
-        } else {
-            periodoArmazenamentoFinal = 0;
-        }
-        calculoReservatorioDetail = `Método <b>Manual</b>: Volume Adotado = <b>${volumeReservatorioFinal.toFixed(0)} L</b>.<br>Com uma demanda de ${reusoPluvial.demandaNaoPotavel} L/dia, este volume garante <b>${periodoArmazenamentoFinal.toFixed(1)} dias</b> de autonomia.`;
-    } else {
-        volumeReservatorioFinal = reusoPluvial.demandaNaoPotavel * reusoPluvial.periodoArmazenamento * (1 / (reusoPluvial.eficienciaReservatorio / 100));
-        calculoReservatorioDetail = `Método <b>Automático</b>:<br>Fórmula: V_res = Demanda_diaria × N_dias / E_res<br>Substituição: V_res = ${reusoPluvial.demandaNaoPotavel} × ${reusoPluvial.periodoArmazenamento} / ${reusoPluvial.eficienciaReservatorio/100} = <b>${volumeReservatorioFinal.toFixed(0)} L</b>`;
-    }
-    
-    // Asignar o volume final para o estado para consistência
-    reusoPluvial.volumeReservatorio = volumeReservatorioFinal;
-
-    const reducaoConsumo = consumoTotalAnual > 0 ? (volumeUtilizadoAnual / consumoTotalAnual) * 100 : 0;
-    const economiaAnual = (volumeUtilizadoAnual / 1000) * reusoPluvial.custoAguaPotavel;
-
-    module.results = [
-        { label: "Volume de Chuva Captado", value: (volumeCaptadoAnual).toFixed(2), unit: "m³/ano" },
-        { label: "Demanda Não Potável", value: (demandaNaoPotavelAnual / 1000).toFixed(2), unit: "m³/ano" },
-        { label: "Volume de Reservatório", value: volumeReservatorioFinal.toFixed(0), unit: "L" },
-        { label: "Período de Armazenamento", value: periodoArmazenamentoFinal.toFixed(1), unit: "dias" },
-        { label: "Redução no Consumo Potável", value: reducaoConsumo.toFixed(2), unit: "%" },
-        { label: "Economia Anual Estimada", value: `R$ ${economiaAnual.toFixed(2)}`, unit: "" },
-    ];
-    
-    module.calculationSteps = [
-        { description: "Cálculo do Volume Captável (NBR 15527)", detail: `Fórmula: V = P × A × C × E_filtro<br>Substituição: V = (${reusoPluvial.precipitacaoMedia}/1000) × ${reusoPluvial.areaCaptacao} × ${reusoPluvial.coeficienteRunoff} × ${reusoPluvial.eficienciaFiltro/100} = <b>${volumeCaptadoAnual.toFixed(2)} m³/ano</b>` },
-        { description: "Cálculo do Volume do Reservatório", detail: calculoReservatorioDetail },
-        { description: "Estimativa de Economia", detail: `Volume Anual Utilizado: ${ (volumeUtilizadoAnual/1000).toFixed(2) } m³<br>Redução Consumo: <b>${reducaoConsumo.toFixed(2)}%</b><br>Economia Financeira: <b>R$ ${economiaAnual.toFixed(2)}/ano</b>` },
-    ];
-
-    return module;
-};
-const calculateGas = (module: Module, state: ProjectState): Module => { 
-    const { gas } = state;
-    let abrigo;
-
-    if (gas.tipo === 'gn') {
-        abrigo = DIMENSOES_ABRIGO_GAS['central_gn'];
-    } else { // GLP
-        const tipoCilindro = gas.tipoCilindro || 'P13';
-        const numCilindros = gas.numCilindros || 1;
-        const key = `${numCilindros}x${tipoCilindro}`;
-        abrigo = DIMENSOES_ABRIGO_GAS[key] || DIMENSOES_ABRIGO_GAS['1xP13'];
-    }
-
-    gas.abrigo = abrigo;
-    module.results.push({ label: "Dimensões Abrigo Gás", value: abrigo.dimensoes, unit: "" });
-    module.results.push({ label: "Ventilação Abrigo Gás", value: abrigo.ventilacao, unit: "" });
-    module.calculationSteps.push({ description: "Dimensionamento do Abrigo de Gás (NBR 15526)", detail: `Para a configuração de ${gas.numCilindros || 1} cilindro(s) ${gas.tipoCilindro || ''}, o abrigo deve ter as dimensões mínimas de <b>${abrigo.dimensoes}</b> e ventilação de <b>${abrigo.ventilacao}</b>.`});
-    
-    const d_glp = 1.55; const d_gn = 0.6;
-    const pci_glp_kw_kg = 12.8; const pci_gn_kw_m3 = 9.4;
-    const d = gas.tipo === 'glp' ? d_glp : d_gn;
-    const P_saida_mbar = gas.pressaoSaida * 1000;
-
-    const calculatedCaminhosGas = gas.caminhos.map(caminho => {
-        let potenciaAcumuladaTotal = 0;
-        caminho.trechos.forEach(t => potenciaAcumuladaTotal += t.potencia);
-
-        let perdaAcumulada = 0;
-        let potenciaAcumulada = 0;
-
-        const trechosComCalculo = [...caminho.trechos].reverse().map(trecho => {
-            potenciaAcumulada += trecho.potencia;
-            const Q_kw = potenciaAcumulada;
-            const Q_m3h = gas.tipo === 'glp' ? (Q_kw / pci_glp_kw_kg) / 0.47 : Q_kw / pci_gn_kw_m3;
-            
-            let DN_mm = 15;
-            let PD_mbar = Infinity;
-            const diâmetros = [15, 22, 28, 35, 42]; // Cobre
-            
-            for(let dn of diâmetros) {
-                const D_interno_mm = dn * 0.9;
-                const PD_trecho_bar = (2.316e-7 * Math.pow(Q_m3h, 1.82) * trecho.comprimento * d) / Math.pow(D_interno_mm, 4.82);
-                PD_mbar = PD_trecho_bar * 1000;
-                DN_mm = dn;
-                if ((PD_mbar / P_saida_mbar) < 0.1) { // Basic check
-                    break;
-                }
-            }
-            perdaAcumulada += PD_mbar;
-            return { ...trecho, potenciaAcumulada: Q_kw, vazao: Q_m3h, diametro: DN_mm, perdaCarga: PD_mbar, perdaCargaAcumulada: perdaAcumulada };
-        }).reverse();
-        
-        return { ...caminho, trechos: trechosComCalculo, perdaTotal: perdaAcumulada };
-    });
-    
-    module.caminhosGas = calculatedCaminhosGas;
-    
-    return module; 
 };

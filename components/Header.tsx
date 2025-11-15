@@ -21,8 +21,8 @@ export const Header: React.FC<HeaderProps> = ({ isDarkMode, toggleTheme, onSaveP
               <i className="fas fa-tint text-3xl"></i>
             </div>
             <div>
-              <h1 className="text-2xl md:text-3xl font-bold tracking-tight">Memorial Hidrossanitário PRO</h1>
-              <p className="text-primary-200 text-sm">Sistema de Aprovação Municipal - Conforme Normas ABNT</p>
+              <h1 className="text-2xl md:text-3xl font-bold tracking-tight">Memorial Hidrossanitário</h1>
+              <p className="text-primary-200 text-sm">conforme Normas ABNT</p>
             </div>
           </div>
           <div className="flex flex-wrap justify-center gap-2">

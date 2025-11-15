@@ -143,14 +143,13 @@ const App: React.FC = () => {
     setIsGeneratingPdf(true);
     setPdfGenerationProgress(0);
     const { updatedState, freshEnabledModules } = prepareReportData();
-    const html = getReportHtml({ ...updatedState, buildingTypes, enabledModules: freshEnabledModules });
     
     const progressCallback = (progress: number) => {
         setPdfGenerationProgress(progress);
     };
 
     try {
-      await generateReport(html, updatedState, progressCallback);
+      await generateReport({ ...updatedState, buildingTypes, enabledModules: freshEnabledModules }, progressCallback);
     } catch(error) {
        console.error("PDF generation failed:", error);
        alert("Ocorreu um erro ao gerar o PDF. Por favor, tente novamente.");
@@ -167,7 +166,11 @@ const App: React.FC = () => {
 
   const handleGenerateART = () => {
     const html = generateART({ ...state, buildingTypes, enabledModules });
-    generateReport(html, state);
+    // This function returns HTML, we need to create a simple viewer or download it.
+    const blob = new Blob([html], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    window.open(url, '_blank');
+    URL.revokeObjectURL(url);
   };
 
 

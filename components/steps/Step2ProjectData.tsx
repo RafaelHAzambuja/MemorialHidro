@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { ProjectState, MemorialVersion } from '../../types';
+import { ProjectState, MemorialVersion, FloorGroup } from '../../types';
 import { estimatePopulation } from '../../services/utils';
 import { fileToBase64 } from '../../services/utils';
 
@@ -141,6 +141,23 @@ export const Step2ProjectData: React.FC<Step2Props> = ({ state, onStateChange, n
         onStateChange({ projectInfo: { ...projectInfo, memorialVersions: updatedVersions } });
     };
 
+    const handleFloorGroupChange = (index: number, field: keyof FloorGroup, value: number) => {
+        const updatedGroups = [...buildingData.floorGroups];
+        updatedGroups[index] = { ...updatedGroups[index], [field]: value };
+        onStateChange({ buildingData: { ...buildingData, floorGroups: updatedGroups } });
+    };
+
+    const addFloorGroup = () => {
+        const newGroup: FloorGroup = { id: Date.now(), numFloors: 1, aptsPerFloor: 4 };
+        onStateChange({ buildingData: { ...buildingData, floorGroups: [...buildingData.floorGroups, newGroup] } });
+    };
+
+    const removeFloorGroup = (index: number) => {
+        if (buildingData.floorGroups.length <= 1) return;
+        const updatedGroups = buildingData.floorGroups.filter((_, i) => i !== index);
+        onStateChange({ buildingData: { ...buildingData, floorGroups: updatedGroups } });
+    };
+
     const renderBuildingForm = () => {
         switch (state.selectedBuildingType) {
             case 0: // Unifamiliar
@@ -155,11 +172,35 @@ export const Step2ProjectData: React.FC<Step2Props> = ({ state, onStateChange, n
                     </div>
                 );
             case 1: // Multifamiliar
+                const totalFloors = buildingData.floorGroups.reduce((acc, g) => acc + (Number(g.numFloors) || 0), 0);
+                const totalApts = buildingData.floorGroups.reduce((acc, g) => acc + ((Number(g.numFloors) || 0) * (Number(g.aptsPerFloor) || 0)), 0);
                  return (
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                        <InputField label="Nº de Pisos" name="pisos" type="number" min="1" value={buildingData.pisos} onChange={(e: any) => handleChange(e, 'buildingData')} />
-                        <InputField label="Aptos/Andar" name="aptPorAndar" type="number" min="1" value={buildingData.aptPorAndar} onChange={(e: any) => handleChange(e, 'buildingData')} />
-                        <InputField label="Pessoas/Apto" name="pessoasPorApt" type="number" min="1" value={buildingData.pessoasPorApt} onChange={(e: any) => handleChange(e, 'buildingData')} />
+                    <div className="space-y-4">
+                        {buildingData.floorGroups.map((group, index) => (
+                            <div key={group.id} className="grid grid-cols-3 md:grid-cols-4 gap-4 items-center p-2 bg-slate-50 dark:bg-slate-700/50 rounded-lg">
+                                <InputField label="Nº de Pavimentos" name="numFloors" type="number" min="1" value={group.numFloors} onChange={(e: any) => handleFloorGroupChange(index, 'numFloors', Number(e.target.value))} />
+                                <InputField label="Aptos/Pavimento" name="aptsPerFloor" type="number" min="1" value={group.aptsPerFloor} onChange={(e: any) => handleFloorGroupChange(index, 'aptsPerFloor', Number(e.target.value))} />
+                                <InputField label="Pessoas/Apto" name="pessoasPorApt" type="number" min="1" value={buildingData.pessoasPorApt} onChange={(e: any) => handleChange(e, 'buildingData')} />
+                                <button onClick={() => removeFloorGroup(index)} disabled={buildingData.floorGroups.length <= 1} className="px-3 py-2 text-red-600 hover:bg-red-100 dark:hover:bg-red-900/50 rounded-md disabled:opacity-50 disabled:cursor-not-allowed">
+                                    <i className="fas fa-trash"></i>
+                                </button>
+                            </div>
+                        ))}
+                        <button onClick={addFloorGroup} className="mt-2 bg-primary-100 text-primary-800 hover:bg-primary-200 dark:bg-primary-900/50 dark:text-primary-200 px-3 py-1.5 rounded-lg text-sm flex items-center gap-2"><i className="fas fa-plus"></i> Adicionar Grupo de Pavimentos</button>
+                        <div className="mt-4 p-4 bg-primary-50 dark:bg-primary-900/50 rounded-lg flex justify-around text-center">
+                            <div>
+                                <p className="text-sm text-primary-700 dark:text-primary-300">Total Pavimentos</p>
+                                <p className="text-xl font-bold text-primary-900 dark:text-primary-100">{totalFloors}</p>
+                            </div>
+                            <div>
+                                <p className="text-sm text-primary-700 dark:text-primary-300">Total Apartamentos</p>
+                                <p className="text-xl font-bold text-primary-900 dark:text-primary-100">{totalApts}</p>
+                            </div>
+                            <div>
+                                <p className="text-sm text-primary-700 dark:text-primary-300">População Total</p>
+                                <p className="text-xl font-bold text-primary-900 dark:text-primary-100">{totalApts * buildingData.pessoasPorApt}</p>
+                            </div>
+                        </div>
                     </div>
                 );
             default: // Comercial / Industrial

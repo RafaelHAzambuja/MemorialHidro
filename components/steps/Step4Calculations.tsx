@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Module, ProjectState, Trecho, PecaRecalque, EsgotoItem, AreaPluvial, TrechoGas, Caminho, RamalVentilacao, CaminhoGas, ComplianceItem, ColetorPluvial, AparelhoConsumo, Bomba, Aquecedor, PecaConexao } from '../../types';
 import { calculateModule } from '../../services/calculationService';
 import { buildingTypes, CONEXOES_AGUA_DB, APARELHOS_SANITARIOS_UHC, APARELHOS_PRESSAO_MINIMA, MANNING_COEFFICIENTS, TANQUES_COMERCIAIS, HIDROMETROS_DB, CHECKLIST_ITEMS, APARELHOS_DESCARGA_DB, APARELHOS_PESOS } from '../../constants';
+import { calculateDemandaReuso } from '../../services/utils';
 
 
 interface Step4Props {
@@ -382,6 +383,13 @@ export const Step4Calculations: React.FC<Step4Props> = ({ state, onStateChange, 
                             <Input label="Nº Reserv. Inferiores" name="numInferiores" value={state.reservatorios.numInferiores} onChange={(e:any) => handleStatePathChange(e, ['reservatorios'])} />
                             <Input label="% Volume Superior" name="percentualSuperior" type="number" step="5" min="0" max="100" value={state.reservatorios.percentualSuperior} onChange={(e:any) => handleStatePathChange(e, ['reservatorios'])} />
                         </div>
+                        <div className="grid md:grid-cols-2 gap-4 mt-4 pt-4 border-t dark:border-slate-700">
+                           <Select label="Integração da RTI" name="integracaoIncendio" value={state.reservatorios.integracaoIncendio} onChange={(e: any) => handleStatePathChange(e, ['reservatorios'])}>
+                                <option value="somar">Somar ao Volume de Consumo</option>
+                                <option value="integrada">Integrada no Volume de Consumo</option>
+                           </Select>
+                           <Input label="% RTI no Reserv. Superior" name="percentualIncendioSuperior" type="number" step="5" min="0" max="100" value={state.reservatorios.percentualIncendioSuperior} onChange={(e: any) => handleStatePathChange(e, ['reservatorios'])} />
+                        </div>
                         {volSupCalc > 0 && (
                             <div className="col-span-full mt-4 p-4 bg-emerald-50 dark:bg-emerald-900/50 rounded-lg">
                                 <h5 className="font-semibold text-emerald-800 dark:text-emerald-200 mb-2">Seleção de Reservatório Comercial</h5>
@@ -716,13 +724,47 @@ export const Step4Calculations: React.FC<Step4Props> = ({ state, onStateChange, 
                 </div>
             );
         case 'Esgoto Gorduroso':
-             return (
+            const isMultifamiliar = buildingTypes[state.selectedBuildingType].name === 'Multifamiliar';
+            const isResidencial = ['Unifamiliar', 'Multifamiliar'].includes(buildingTypes[state.selectedBuildingType].name);
+
+            return (
                 <Section title="Caixa de Gordura">
-                    {["Comercial", "Industrial"].includes(buildingTypes[state.selectedBuildingType].name) ? (
-                        <Input label="Nº de Refeições/dia" name="numeroRefeicoes" value={state.gorduraData.numeroRefeicoes} onChange={(e: any) => handleStatePathChange(e, ['gorduraData'])} />
-                    ) : (
-                        <p className="text-sm text-slate-600 dark:text-slate-400">O dimensionamento para edificações residenciais é automático com base no número de cozinhas (definido em "Dados do Projeto").</p>
+                    {isMultifamiliar && (
+                        <div className="mb-4">
+                            <Select 
+                                label="Tipo de Instalação" 
+                                name="tipoInstalacao" 
+                                value={state.gorduraData.tipoInstalacao} 
+                                onChange={(e: any) => handleStatePathChange(e, ['gorduraData'])}
+                            >
+                                <option value="central">Central (uma caixa para o prédio)</option>
+                                <option value="individual">Individual (uma caixa por apartamento)</option>
+                            </Select>
+                        </div>
                     )}
+
+                    {isResidencial ? (
+                        state.gorduraData.tipoInstalacao === 'individual' && isMultifamiliar ? (
+                             <p className="text-sm p-4 bg-slate-50 dark:bg-slate-700/50 rounded-lg">
+                                Para a instalação individual, será dimensionada uma Caixa de Gordura Simples (CS) com volume de 18L para cada apartamento, conforme a NBR 8160.
+                             </p>
+                        ) : (
+                             <Input 
+                                label="Nº Total de Cozinhas" 
+                                name="numeroCozinhas" 
+                                value={state.gorduraData.numeroCozinhas} 
+                                onChange={(e: any) => handleStatePathChange(e, ['gorduraData'])} 
+                                />
+                        )
+                    ) : ( // Comercial/Industrial
+                        <Input 
+                            label="Nº de Refeições/dia" 
+                            name="numeroRefeicoes" 
+                            value={state.gorduraData.numeroRefeicoes} 
+                            onChange={(e: any) => handleStatePathChange(e, ['gorduraData'])} 
+                        />
+                    )}
+
                     <div className="mt-4">
                         <Input label="Nº Tubos Queda Gordura" name="numTubosQuedaGordura" value={state.gorduraData.numTubosQuedaGordura} onChange={(e: any) => handleStatePathChange(e, ['gorduraData'])} />
                     </div>
@@ -810,9 +852,24 @@ export const Step4Calculations: React.FC<Step4Props> = ({ state, onStateChange, 
                  </div>
             );
         case 'Reúso de Água Pluvial':
+            const handleSuggestReusoData = () => {
+                const buildingTypeName = buildingTypes[state.selectedBuildingType].name;
+                const { demanda, area } = calculateDemandaReuso(state.buildingData, buildingTypeName, state.reusoPluvial, state.areasPluviais);
+                onStateChange({
+                  reusoPluvial: {
+                    ...state.reusoPluvial,
+                    demandaNaoPotavel: demanda,
+                    areaCaptacao: area,
+                  }
+                });
+            };
             return (
                 <div className="space-y-6">
-                    <Section title="Parâmetros Gerais (NBR 15527)">
+                    <div className="p-4 bg-sky-50 dark:bg-sky-900/50 rounded-lg flex items-center justify-between">
+                        <p className="text-sm text-sky-700 dark:text-sky-300">Não tem certeza dos valores? Use nossa sugestão baseada nos dados da edificação.</p>
+                        <button onClick={handleSuggestReusoData} className="bg-sky-600 hover:bg-sky-700 text-white px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2"><i className="fas fa-magic"></i> Sugerir Dados</button>
+                    </div>
+                    <Section title="Parâmetros de Captação e Demanda (NBR 15527)">
                         <div className="grid md:grid-cols-3 gap-4">
                             <Input label="Área de Captação (m²)" name="areaCaptacao" value={state.reusoPluvial.areaCaptacao} onChange={(e:any) => handleStatePathChange(e, ['reusoPluvial'])} />
                             <Input label="Coeficiente de Runoff" name="coeficienteRunoff" value={state.reusoPluvial.coeficienteRunoff} onChange={(e:any) => handleStatePathChange(e, ['reusoPluvial'])} step="0.01" />
@@ -833,6 +890,13 @@ export const Step4Calculations: React.FC<Step4Props> = ({ state, onStateChange, 
                                <Input label="Volume do Reservatório Adotado (L)" name="volumeReservatorioAdotado" value={state.reusoPluvial.volumeReservatorioAdotado} onChange={(e: any) => handleStatePathChange(e, ['reusoPluvial'])} />
                            )}
                         </div>
+                    </Section>
+                     <Section title="Análise Financeira (Payback)">
+                        <div className="grid md:grid-cols-2 gap-4">
+                            <Input label="Custo da Água Potável (R$/m³)" name="custoAguaPotavel" value={state.reusoPluvial.custoAguaPotavel} onChange={(e:any) => handleStatePathChange(e, ['reusoPluvial'])} />
+                            <Input label="Custo Manutenção Anual (R$)" name="manutencaoAnual" value={state.reusoPluvial.manutencaoAnual} onChange={(e:any) => handleStatePathChange(e, ['reusoPluvial'])} />
+                        </div>
+                        <p className="text-xs text-slate-500 mt-2">O cálculo de payback assume um custo de investimento de R$ 2,00 por litro de reservatório (incluindo equipamentos). Este é um valor estimado para análise preliminar.</p>
                     </Section>
                     <Section title="Demandas (Usos Não Potáveis)">
                         <div className="grid md:grid-cols-2 gap-4">
@@ -897,6 +961,26 @@ export const Step4Calculations: React.FC<Step4Props> = ({ state, onStateChange, 
                          <ActionButton onClick={() => addArrayItem(['gas', 'caminhos'], { id: Date.now(), nome: `Novo Ponto ${state.gas.caminhos.length + 1}`, trechos: [] })}><i className="fas fa-plus"></i> Adicionar Ponto Desfavorável</ActionButton>
                     </Section>
                 </div>
+            );
+        case 'Lixeira':
+            return (
+                <Section title="Dimensionamento do Abrigo de Resíduos Sólidos">
+                    <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-4">
+                        <Select label="Tipo de Coleta" name="tipoColeta" value={state.lixeira.tipoColeta} onChange={(e:any) => handleStatePathChange(e, ['lixeira'])}>
+                            <option value="seletiva">Seletiva</option>
+                            <option value="indiferenciada">Indiferenciada</option>
+                        </Select>
+                        <div>
+                             <Input label="Contribuição Diária (L/hab.dia)" name="contribuicaoDiaria" value={state.lixeira.contribuicaoDiaria} onChange={(e:any) => handleStatePathChange(e, ['lixeira'])} />
+                            <p className="text-xs text-slate-500 mt-1">Sugestão: 2.5 (Resid.), 1.5 (Comerc.)</p>
+                        </div>
+                        <Input label="Frequência de Coleta (dias)" name="frequenciaColeta" value={state.lixeira.frequenciaColeta} onChange={(e:any) => handleStatePathChange(e, ['lixeira'])} />
+                        <div>
+                            <Input label="Taxa de Acumulação" name="taxaAcumulacao" value={state.lixeira.taxaAcumulacao} step="0.01" onChange={(e:any) => handleStatePathChange(e, ['lixeira'])} />
+                            <p className="text-xs text-slate-500 mt-1">Ex: 1.25 para 25% de folga</p>
+                        </div>
+                    </div>
+                </Section>
             );
         default:
              return <p className="text-sm text-slate-600 dark:text-slate-400">Parâmetros para este módulo são configurados em outras seções ou calculados automaticamente.</p>;

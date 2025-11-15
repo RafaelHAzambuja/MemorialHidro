@@ -23,12 +23,17 @@ export interface Engenheiro {
   art: string;
 }
 
+export interface FloorGroup {
+  id: number;
+  numFloors: number;
+  aptsPerFloor: number;
+}
+
 export interface BuildingData {
   pavimentos: number;
   pessoas: number;
   dormitorios: number;
-  pisos: number;
-  aptPorAndar: number;
+  floorGroups: FloorGroup[];
   pessoasPorApt: number;
   areaTotal: number;
 }
@@ -48,6 +53,8 @@ export interface Reservatorios {
   reservaIncendio: number;
   volumeSuperiorComercial?: number;
   volumeInferiorComercial?: number;
+  percentualIncendioSuperior: number;
+  integracaoIncendio: 'somar' | 'integrada';
 }
 
 export interface PecaRecalque {
@@ -267,6 +274,7 @@ export interface GorduraData {
   numeroRefeicoes: number;
   numeroCozinhas: number;
   numTubosQuedaGordura: number;
+  tipoInstalacao?: 'central' | 'individual';
 }
 
 export interface ColetorPluvial {
@@ -416,6 +424,13 @@ export interface Norma {
     descricao: string;
 }
 
+export interface Lixeira {
+  tipoColeta: 'indiferenciada' | 'seletiva';
+  contribuicaoDiaria: number; // L/hab.dia
+  frequenciaColeta: number; // dias
+  taxaAcumulacao: number; // ex: 1.25 para 25%
+}
+
 export interface Module {
   name: string;
   description: string;
@@ -463,6 +478,7 @@ export interface ProjectState {
   reusoPluvial: ReusoPluvial;
   areasPluviais: AreaPluvial[];
   gas: Gas;
+  lixeira: Lixeira;
   plantas: Plantas;
   plantasBase64: PlantasBase64;
   customLogo: string | null;

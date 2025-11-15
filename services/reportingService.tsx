@@ -1,13 +1,18 @@
+
 import React from 'react';
 import ReactDOMServer from 'react-dom/server';
-import { ProjectState, BuildingType, Module, Norma, Caminho, Trecho, MemorialVersion } from '../types';
+import { jsPDF } from 'jspdf';
+import autoTable from 'jspdf-autotable';
+import { ProjectState, BuildingType, Module, Norma, Caminho, Trecho, MemorialVersion, CaminhoGas } from '../types';
 import { REPORT_TEXTS } from '../constants';
 
-
-declare const htmlDocx: any;
-declare const saveAs: any;
-declare const jspdf: any;
-declare const html2canvas: any;
+// FIX: Replaced a problematic interface extension with a type intersection.
+// This correctly combines the jsPDF type with autotable plugin properties,
+// resolving all "Property does not exist on type 'jsPDFWithAutoTable'" errors.
+type jsPDFWithAutoTable = jsPDF & {
+  lastAutoTable: { finalY: number };
+  y: number;
+};
 
 interface ReportProps {
     buildingTypes: BuildingType[];
@@ -17,65 +22,459 @@ interface ReportProps {
 const fNum = (num: number | string | undefined | null, p = 2) => {
     if (num === undefined || num === null) return "-";
     const n = typeof num === 'string' ? parseFloat(num) : num;
-    if (isNaN(n)) return num;
+    if (isNaN(n)) return String(num);
     return n.toLocaleString("pt-BR", { minimumFractionDigits: p, maximumFractionDigits: p });
 };
 
+// Componentes para DOCX (HTML)
 const PageBreak: React.FC = () => <div style={{ pageBreakAfter: 'always' }}></div>;
-
 const H2: React.FC<{children: React.ReactNode}> = ({children}) => <h2 style={{ color: '#166534', borderBottom: '2px solid #15803d', paddingBottom: '8px', fontSize: '16pt', pageBreakBefore: 'auto', pageBreakAfter: 'avoid' }}>{children}</h2>;
 const H3: React.FC<{children: React.ReactNode}> = ({children}) => <h3 style={{ color: '#14532d', fontSize: '13pt', marginTop: '20px', pageBreakAfter: 'avoid' }}>{children}</h3>;
 const Th: React.FC<{children: React.ReactNode, style?: React.CSSProperties}> = ({children, style}) => <th style={{ padding: '4px', textAlign: 'center', border: '1px solid #ccc', background: '#f2f2f2', fontSize: '8pt', color: '#333', ...style }}>{children}</th>;
 const Td: React.FC<{children: React.ReactNode, style?: React.CSSProperties}> = ({children, style}) => <td style={{ padding: '4px', textAlign: 'center', border: '1px solid #ccc', fontSize: '8pt', color: '#333', ...style }}>{children}</td>;
 
-const DetailedHeadLossTable: React.FC<{caminho: Caminho}> = ({caminho}) => (
-    <div style={{marginTop: '15px', pageBreakInside: 'avoid'}}>
-        <h5 style={{fontSize: '11pt', fontWeight: 'bold'}}>{caminho.nome}</h5>
-        <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: '5px' }}>
-            <thead>
-                <tr>
-                    <Th style={{textAlign: 'left'}}>Trecho</Th>
-                    <Th>Comp. Real (m)</Th>
-                    <Th>Comp. Eq. (m)</Th>
-                    <Th>Vazão (L/s)</Th>
-                    <Th>Veloc. (m/s)</Th>
-                    <Th>DN (mm)</Th>
-                    <Th>PD Unit. (m/m)</Th>
-                    <Th>PD Total (mca)</Th>
-                    <Th>Pressão Final (mca)</Th>
-                </tr>
-            </thead>
-            <tbody>
-                {caminho.trechos.map((t: Trecho) => (
-                    <tr key={t.id}>
-                        <Td style={{textAlign: 'left'}}>{t.descricao}</Td>
-                        <Td>{fNum(t.comprimentoReal)}</Td>
-                        <Td>{fNum(t.comprimentoEquivalente)}</Td>
-                        <Td>{fNum(t.vazao)}</Td>
-                        <Td>{fNum(t.velocidade)}</Td>
-                        <Td>{t.diametroNominal}</Td>
-                        <Td>{fNum(t.perdaCargaUnitaria, 5)}</Td>
-                        <Td>{fNum(t.perdaCargaTotal)}</Td>
-                        <Td>{fNum(t.pressaoFinal)}</Td>
-                    </tr>
-                ))}
-            </tbody>
-        </table>
-    </div>
-);
+// Gerador de PDF
+class PdfGenerator {
+    private pdf: jsPDFWithAutoTable;
+    private state: ProjectState & ReportProps;
+    private onProgress: (progress: number) => void;
+    private y: number = 25;
+    private page: number = 1;
+    private tocEntries: { title: string, page: number, level: number }[] = [];
+    private readonly PAGE_WIDTH: number;
+    private readonly PAGE_HEIGHT: number;
+    private readonly MARGIN: number = 20;
+
+    constructor(state: ProjectState & ReportProps, onProgress: (progress: number) => void = () => {}) {
+        // FIX: Cast the jsPDF instance to our extended interface to make plugin properties type-safe.
+        this.pdf = new jsPDF('p', 'mm', 'a4') as jsPDFWithAutoTable;
+        this.pdf.y = 0;
+        this.state = state;
+        this.onProgress = onProgress;
+        this.PAGE_WIDTH = this.pdf.internal.pageSize.getWidth();
+        this.PAGE_HEIGHT = this.pdf.internal.pageSize.getHeight();
+    }
+    
+    private addPage() {
+        this.pdf.addPage();
+        this.page++;
+        this.y = this.MARGIN;
+        this.addHeaderFooter();
+    }
+    
+    private checkPageBreak(height: number) {
+        if (this.y + height > this.PAGE_HEIGHT - this.MARGIN) {
+            this.addPage();
+        }
+    }
+    
+    private startNewSection() {
+        if (this.y > this.MARGIN + 10) { // Add a threshold to avoid unnecessary new pages
+            this.addPage();
+        }
+    }
+
+    private addHeaderFooter() {
+        if (this.page > 1 && !this.tocEntries.some(e => e.page === this.page)) {
+            this.pdf.setFontSize(8);
+            this.pdf.setTextColor(150);
+            if (this.state.customLogo) {
+                try { this.pdf.addImage(this.state.customLogo, 'PNG', this.MARGIN, 10, 15, 15); } 
+                catch (e) { console.error("Could not add logo:", e); }
+            }
+            this.pdf.text(this.state.projectInfo.name, this.PAGE_WIDTH / 2, 15, { align: 'center' });
+            this.pdf.setDrawColor(220);
+            this.pdf.line(this.MARGIN, 18, this.PAGE_WIDTH - this.MARGIN, 18);
+
+            this.pdf.line(this.MARGIN, this.PAGE_HEIGHT - 18, this.PAGE_WIDTH - this.MARGIN, this.PAGE_HEIGHT - 18);
+            this.pdf.text(`${this.state.engenheiro.nome} - ${this.state.engenheiro.crea}`, this.MARGIN, this.PAGE_HEIGHT - 13);
+            this.pdf.text(`Página ${this.page}`, this.PAGE_WIDTH - this.MARGIN, this.PAGE_HEIGHT - 13, { align: 'right' });
+        }
+    }
+    
+    private renderH2(text: string, addToc: boolean = true, level: number = 1) {
+        this.checkPageBreak(20);
+        this.pdf.setFontSize(16);
+        this.pdf.setTextColor('#166534');
+        this.pdf.setFont('helvetica', 'bold');
+        this.pdf.text(text, this.MARGIN, this.y);
+        this.y += 10;
+        if(addToc) this.tocEntries.push({ title: text, page: this.page, level });
+    }
+
+    private renderH3(text: string) {
+        this.checkPageBreak(15);
+        this.pdf.setFontSize(13);
+        this.pdf.setTextColor('#14532d');
+        this.pdf.setFont('helvetica', 'bold');
+        this.pdf.text(text, this.MARGIN, this.y);
+        this.y += 8;
+    }
+    
+    private renderText(text: string, size: number = 10, style: 'normal' | 'bold' = 'normal') {
+        const maxWidth = this.PAGE_WIDTH - this.MARGIN * 2;
+        const lineHeightRatio = 1.5;
+        this.pdf.setFontSize(size);
+        this.pdf.setTextColor(0); // Garante texto preto
+        this.pdf.setFont('helvetica', style);
+        this.pdf.setLineHeightFactor(lineHeightRatio);
+
+        const lines = this.pdf.splitTextToSize(text, maxWidth);
+        const textHeight = lines.length * this.pdf.getLineHeight();
+        this.checkPageBreak(textHeight + 4);
+
+        this.pdf.text(text, this.MARGIN, this.y, { maxWidth: maxWidth });
+        
+        this.y += textHeight + 4;
+    }
+    
+    private renderHtml(html: string) {
+        type LinePart = { text: string; isBold: boolean; isSub: boolean; };
+        
+        const cleanHtml = html
+            .replace(/<p>/g, '')
+            .replace(/<\/p>/g, '\n')
+            .replace(/<br\s*\/?>/g, '\n')
+            .replace(/<li>/g, '• ')
+            .replace(/<\/li>/g, '\n')
+            .replace(/<\/?ul>/g, '\n')
+            .replace(/<h[1-4]>/g, '\n')
+            .replace(/<\/h[1-4]>/g, '\n')
+            .trim();
+
+        const lines = cleanHtml.split('\n');
+
+        const baseFontSize = 10;
+        const subFontSize = baseFontSize * 0.75;
+        this.pdf.setFont('helvetica', 'normal');
+        this.pdf.setTextColor(0); // Garante texto preto
+        this.pdf.setFontSize(baseFontSize);
+        const lineHeightRatio = 1.7; // Aumentado de 1.5 para evitar sobreposição de subscritos
+        const lineHeight = baseFontSize * lineHeightRatio / this.pdf.internal.scaleFactor;
+        const maxWidth = this.PAGE_WIDTH - this.MARGIN * 2;
+
+        const printLine = (lineParts: LinePart[]) => {
+            this.checkPageBreak(lineHeight);
+            let currentX = this.MARGIN;
+            const baselineY = this.y;
+
+            for (const part of lineParts) {
+                let partY = baselineY;
+                let currentFontSize = baseFontSize;
+
+                if (part.isSub) {
+                    partY = baselineY + (subFontSize / 2.5);
+                    currentFontSize = subFontSize;
+                }
+
+                this.pdf.setFont('helvetica', part.isBold ? 'bold' : 'normal');
+                this.pdf.setFontSize(currentFontSize);
+                this.pdf.text(part.text, currentX, partY, { charSpace: 0 });
+                currentX += this.pdf.getTextWidth(part.text);
+            }
+            this.pdf.setFontSize(baseFontSize);
+            this.y += lineHeight;
+        };
+
+        for (const line of lines) {
+            if (line.trim() === '') {
+                this.checkPageBreak(lineHeight / 2);
+                this.y += lineHeight / 2;
+                continue;
+            }
+
+            const parts = line.split(/(<\/?(?:strong|b|i|sub)>)/g).filter(p => p);
+            const processedParts: { text: string; isBold: boolean; isSub: boolean; }[] = [];
+            let isBold = false;
+            let isSub = false;
+
+            for (const part of parts) {
+                if (part === '<strong>' || part === '<b>') isBold = true;
+                else if (part === '</strong>' || part === '</b>') isBold = false;
+                else if (part === '<sub>') isSub = true;
+                else if (part === '</sub>') isSub = false;
+                else if (part !== '<i>' && part !== '</i>') {
+                    processedParts.push({ text: part.replace(/&[a-z]+;/g, ' '), isBold, isSub });
+                }
+            }
+
+            const allWords: LinePart[] = [];
+            for (const part of processedParts) {
+                const words = part.text.split(/(\s+)/);
+                for (const word of words) {
+                    if (word) {
+                        allWords.push({ text: word, isBold: part.isBold, isSub: part.isSub });
+                    }
+                }
+            }
+
+            let currentLineParts: LinePart[] = [];
+            let currentLineWidth = 0;
+
+            for (const word of allWords) {
+                this.pdf.setFont('helvetica', word.isBold ? 'bold' : 'normal');
+                this.pdf.setFontSize(word.isSub ? subFontSize : baseFontSize);
+                const wordWidth = this.pdf.getTextWidth(word.text);
+
+                if (currentLineWidth + wordWidth > maxWidth && currentLineParts.length > 0) {
+                    printLine(currentLineParts);
+                    currentLineParts = [];
+                    currentLineWidth = 0;
+                    if (word.text.trim() === '') continue;
+                }
+                currentLineParts.push(word);
+                currentLineWidth += wordWidth;
+            }
+            if (currentLineParts.length > 0) {
+                printLine(currentLineParts);
+            }
+        }
+    }
+    
+    private renderCalculationStep(step: {description: string, detail: string}) {
+        this.checkPageBreak(20); 
+        this.renderText(step.description, 11, 'bold');
+        this.renderHtml(step.detail);
+        this.y += 4;
+    }
+    
+    private renderCoverPage() {
+        this.pdf.setDrawColor('#14532d');
+        this.pdf.setLineWidth(1);
+        this.pdf.rect(5, 5, this.PAGE_WIDTH - 10, this.PAGE_HEIGHT - 10);
+        
+        let y = 60;
+        
+        if (this.state.customLogo) {
+             try { 
+                 this.pdf.addImage(this.state.customLogo, 'PNG', (this.PAGE_WIDTH / 2) - 20, y, 40, 40);
+                 y += 60;
+             } catch(e) { console.error("Could not add logo:", e); }
+        } else {
+             y += 40;
+        }
+
+        this.pdf.setFontSize(28);
+        this.pdf.setTextColor('#14532d');
+        this.pdf.text('Memorial Descritivo e de Cálculo', this.PAGE_WIDTH / 2, y, { align: 'center' });
+        y += 15;
+
+        this.pdf.setFontSize(16);
+        this.pdf.setTextColor('#15803d');
+        this.pdf.text('Projeto Hidrossanitário', this.PAGE_WIDTH / 2, y, { align: 'center' });
+        y += 50;
+
+        this.pdf.setFontSize(14);
+        this.pdf.setTextColor('#333333');
+        this.pdf.text(`Projeto: ${this.state.projectInfo.name}`, this.PAGE_WIDTH / 2, y, { align: 'center' });
+        y += 10;
+        this.pdf.text(`Proprietário: ${this.state.projectInfo.proprietario}`, this.PAGE_WIDTH / 2, y, { align: 'center' });
+
+        y = this.PAGE_HEIGHT - 60;
+        const date = new Date(this.state.projectInfo.date);
+        const formattedDate = new Date(date.getTime() + date.getTimezoneOffset() * 60000).toLocaleDateString("pt-BR", { year: 'numeric', month: 'long', day: 'numeric' });
+        this.pdf.text(this.state.projectInfo.location, this.PAGE_WIDTH / 2, y, { align: 'center' });
+        y += 10;
+        this.pdf.text(formattedDate, this.PAGE_WIDTH / 2, y, { align: 'center' });
+    }
+    
+    private renderTOC() {
+        this.addHeaderFooter();
+        this.renderH2("ÍNDICE", false);
+        const initialY = this.y;
+        
+        this.tocEntries.forEach(entry => {
+            this.checkPageBreak(8);
+            const indent = (entry.level - 1) * 10;
+            this.pdf.setFontSize(entry.level === 1 ? 12 : 11);
+            this.pdf.setTextColor(0); // Garante texto preto
+            this.pdf.setFont('helvetica', 'normal');
+            const title = entry.title;
+            const pageNum = entry.page.toString();
+            const titleWidth = this.pdf.getStringUnitWidth(title) * this.pdf.getFontSize() / this.pdf.internal.scaleFactor;
+            const pageNumWidth = this.pdf.getStringUnitWidth(pageNum) * this.pdf.getFontSize() / this.pdf.internal.scaleFactor;
+            const availableWidth = this.PAGE_WIDTH - (this.MARGIN * 2) - indent - titleWidth - pageNumWidth - 2;
+            const dots = '.'.repeat(Math.max(0, Math.floor(availableWidth / (this.pdf.getStringUnitWidth('.') * this.pdf.getFontSize() / this.pdf.internal.scaleFactor))));
+            
+            this.pdf.text(`${title} ${dots}`, this.MARGIN + indent, this.y);
+            this.pdf.text(pageNum, this.PAGE_WIDTH - this.MARGIN, this.y, { align: 'right'});
+            this.y += 7;
+        });
+
+        this.y = initialY;
+        this.tocEntries.forEach(entry => {
+            if (this.y + 8 > this.PAGE_HEIGHT - this.MARGIN) {
+                this.y = this.MARGIN;
+            }
+            const indent = (entry.level - 1) * 10;
+            this.pdf.link(this.MARGIN + indent, this.y - 5, this.PAGE_WIDTH - (this.MARGIN*2) , 7, { pageNumber: entry.page });
+            this.y += 7;
+        });
+    }
+
+    public async generate() {
+        this.onProgress(0);
+        
+        this.renderCoverPage();
+        
+        this.addPage();
+        let sectionCounter = 1;
+        this.renderH2(`${sectionCounter++}. OBJETIVO E ESCOPO`);
+        this.renderHtml(REPORT_TEXTS.objetivoEscopo);
+        
+        this.startNewSection();
+        this.renderH2(`${sectionCounter++}. INFORMAÇÕES GERAIS`);
+        this.renderH3("2.1. Descrição da Edificação");
+        this.renderText(`Trata-se de uma edificação de uso ${this.state.buildingTypes[this.state.selectedBuildingType].name}, com área construída de ${this.state.buildingData.areaTotal} m², localizada em ${this.state.projectInfo.location}.`);
+        this.renderH3("2.2. Nome do Proprietário");
+        this.renderText(`Nome: ${this.state.projectInfo.proprietario}\nInscrição Imobiliária: ${this.state.projectInfo.inscricaoImobiliaria}`);
+        this.renderH3("2.3. Responsável Técnico do Projeto");
+        this.renderText(`Nome: ${this.state.engenheiro.nome}\nTítulo/Conselho: Engenheiro Civil / ${this.state.engenheiro.crea}\nART/RRT: ${this.state.engenheiro.art}`);
+        
+        this.startNewSection();
+        this.renderH2(`${sectionCounter++}. BASES NORMATIVAS`);
+        this.renderHtml(REPORT_TEXTS.basesNormativas);
+        const allNormas = this.state.enabledModules.reduce((acc: Norma[], mod) => {
+            mod.normas.forEach(norma => { if (!acc.find(n => n.codigo === norma.codigo)) acc.push(norma); });
+            return acc;
+        }, []);
+        const normasText = allNormas.map(n => `• ${n.codigo} - ${n.descricao}`).join('\n');
+        this.renderText(normasText, 10);
+        
+        this.startNewSection();
+        this.renderH2(`${sectionCounter++}. ESPECIFICAÇÕES GERAIS DE EXECUÇÃO`);
+        this.renderHtml(REPORT_TEXTS.especificacoesGerais);
+
+        for (const [index, module] of this.state.enabledModules.entries()) {
+            this.onProgress(((index + 1) / this.state.enabledModules.length) * 80);
+            
+            this.startNewSection();
+            const modCounter = sectionCounter++;
+            this.renderH2(`${modCounter}. MEMORIAL DE ${module.name.toUpperCase()}`);
+
+            this.renderH3(`${modCounter}.1. Descrição do Sistema`);
+            const descKey = module.name.toLowerCase().replace(/ /g, '').replace(/[áàâã]/g, 'a').replace(/[éèê]/g, 'e').replace(/[íìî]/g, 'i').replace(/[óòôõ]/g, 'o').replace(/[úùû]/g, 'u').replace(/ç/g, 'c');
+            const desc = (REPORT_TEXTS as any)[descKey]?.descricao || '';
+            this.renderHtml(desc);
+            
+            this.startNewSection();
+            this.renderH3(`${modCounter}.2. Critérios de Projeto`);
+            const crit = (REPORT_TEXTS as any)[descKey]?.criterios || '';
+            this.renderHtml(crit);
+
+            this.startNewSection();
+            this.renderH3(`${modCounter}.3. Memorial de Cálculo`);
+            for (const step of module.calculationSteps) {
+                this.renderCalculationStep(step);
+            }
+            
+            if(module.caminhos && module.caminhos.length > 0) {
+                 this.renderH3(`${modCounter}.3.1. Tabelas de Perda de Carga`);
+                 for (const caminho of module.caminhos) {
+                     this.checkPageBreak(30 + caminho.trechos.length * 8);
+                     this.renderText(caminho.nome, 11, 'bold');
+                     autoTable(this.pdf, {
+                         startY: this.y,
+                         head: [['Trecho', 'Comp.(m)', 'Vazão(L/s)', 'Vel.(m/s)', 'DN(mm)', 'PD(mca)', 'Pressão(mca)']],
+                         body: caminho.trechos.map(t => [t.descricao, fNum(t.comprimentoReal), fNum(t.vazao), fNum(t.velocidade), t.diametroNominal, fNum(t.perdaCargaTotal), fNum(t.pressaoFinal)]),
+                         theme: 'grid',
+                         headStyles: { fillColor: '#166534', textColor: 255 },
+                         bodyStyles: { textColor: 0 },
+                         didDrawPage: (data) => {
+                            this.page = data.pageNumber;
+                            this.addHeaderFooter();
+                         },
+                         didParseCell: (data) => {
+                            const trecho = caminho.trechos[data.row.index];
+                            if (data.column.index === 3 && trecho?.velocidadeExcessiva) {
+                                data.cell.styles.textColor = '#ef4444';
+                            }
+                         }
+                     });
+                     this.y = this.pdf.lastAutoTable.finalY + 10;
+                 };
+            }
+
+            if(module.caminhosGas && module.caminhosGas.length > 0) {
+                 this.renderH3(`${modCounter}.3.2. Tabelas de Perda de Carga (Gás)`);
+                 for (const caminho of module.caminhosGas) {
+                     this.checkPageBreak(30 + caminho.trechos.length * 8);
+                     this.renderText(caminho.nome, 11, 'bold');
+                     autoTable(this.pdf, {
+                         startY: this.y,
+                         head: [['Trecho', 'Pot. Acum.(kW)', 'Vazão(m³/h)', 'DN(mm)', 'PD(mbar)', 'PD Acum.(mbar)']],
+                         body: caminho.trechos.map(t => [t.descricao, fNum(t.potenciaAcumulada), fNum(t.vazao, 3), t.diametro, fNum(t.perdaCarga, 3), fNum(t.perdaCargaAcumulada, 3)]),
+                         theme: 'grid',
+                         headStyles: { fillColor: '#166534', textColor: 255 },
+                         bodyStyles: { textColor: 0 },
+                         didDrawPage: (data) => {
+                            this.page = data.pageNumber;
+                            this.addHeaderFooter();
+                         }
+                     });
+                     this.y = this.pdf.lastAutoTable.finalY + 10;
+                 }
+            }
+            
+            this.startNewSection();
+            this.renderH3(`${modCounter}.4. Recomendações de Execução`);
+            const reco = (REPORT_TEXTS as any)[descKey]?.recomendacoes || '';
+            this.renderHtml(reco);
+        }
+        
+        this.startNewSection();
+        this.renderH2(`${sectionCounter++}. APÊNDICE A - MANUAL DE USO E MANUTENÇÃO`);
+        this.renderHtml(REPORT_TEXTS.manualUsoManutencao);
+
+        this.startNewSection();
+        this.renderH2(`${sectionCounter++}. APÊNDICE B - ASSINATURAS`);
+        this.y = this.PAGE_HEIGHT / 2 - 40;
+        this.pdf.setDrawColor(0);
+        this.pdf.setTextColor(0);
+        this.pdf.setLineWidth(0.3);
+        
+        this.pdf.line(this.MARGIN + 30, this.y, this.PAGE_WIDTH - this.MARGIN - 30, this.y);
+        this.pdf.text(`${this.state.engenheiro.nome}\n${this.state.engenheiro.crea}\nResponsável Técnico`, this.PAGE_WIDTH/2, this.y + 5, { align: 'center' });
+        
+        this.y += 60;
+        this.pdf.line(this.MARGIN + 30, this.y, this.PAGE_WIDTH - this.MARGIN - 30, this.y);
+        this.pdf.text(`${this.state.projectInfo.proprietario}\nProprietário`, this.PAGE_WIDTH/2, this.y + 5, { align: 'center' });
+
+        this.onProgress(90);
+
+        const tocPageCount = Math.ceil(this.tocEntries.length / 38);
+        this.tocEntries.forEach(e => e.page += tocPageCount);
+
+        for (let i = 0; i < tocPageCount; i++) {
+            this.pdf.insertPage(2 + i);
+        }
+        
+        this.pdf.setPage(2);
+        this.page = 2;
+        this.y = this.MARGIN;
+        this.renderTOC();
+
+        this.onProgress(100);
+        this.pdf.save(`${this.state.projectInfo.name.replace(/\s+/g, '-').toLowerCase()}.pdf`);
+    }
+}
+
+
+export const generateReport = async (fullState: ProjectState & ReportProps, onProgress?: (progress: number) => void) => {
+    try {
+        const generator = new PdfGenerator(fullState, onProgress);
+        await generator.generate();
+    } catch (error) {
+        console.error("Erro ao gerar PDF:", error);
+        alert("Ocorreu um erro ao tentar gerar o PDF. Detalhes: " + (error as Error).message);
+        throw error;
+    }
+};
+
 
 const ReportTemplate: React.FC<ProjectState & ReportProps> = (props) => {
     const { projectInfo, engenheiro, buildingData, buildingTypes, selectedBuildingType, enabledModules, customLogo } = props;
     const buildingType = buildingTypes[selectedBuildingType];
-    
-    const pageStyle: React.CSSProperties = {
-        width: '210mm',
-        minHeight: '297mm',
-        padding: '25mm 20mm 25mm 20mm',
-        boxSizing: 'border-box',
-        display: 'block',
-        position: 'relative',
-    };
     
     const allNormas = enabledModules.reduce((acc: Norma[], mod) => {
       mod.normas.forEach(norma => {
@@ -103,278 +502,30 @@ const ReportTemplate: React.FC<ProjectState & ReportProps> = (props) => {
 
     return (
         <div style={{ fontFamily: "'Times New Roman', Times, serif", lineHeight: 1.6, color: '#333333', fontSize: '12pt', background: 'white' }}>
-            
-            {/* --- CAPA --- */}
-            <div className="report-page" style={{ ...pageStyle, display: 'flex', flexDirection: 'column', justifyContent: 'space-between', alignItems: 'center', border: '2px solid #14532d', textAlign: 'center' }}>
-                <div>
-                    {customLogo ? <img src={customLogo} alt="Logo" style={{ maxHeight: '100px', marginBottom: '30px', display: 'block', margin: '0 auto' }} /> : <div style={{height: '100px', fontSize: '48px', color: '#14532d'}}><i className="fas fa-tint"></i></div>}
-                    <h1 style={{ fontSize: '28pt', margin: '20px 0 10px 0', color: '#14532d' }}>Memorial Descritivo e de Cálculo</h1>
-                    <p style={{ fontSize: '16pt', margin: '5px 0', color: '#15803d' }}>Projeto Hidrossanitário</p>
-                </div>
-                <div>
-                    <p style={{ fontSize: '14pt' }}><strong>Projeto:</strong> {projectInfo.name}</p>
-                    <p style={{ fontSize: '14pt' }}><strong>Proprietário:</strong> {projectInfo.proprietario}</p>
-                </div>
-                <div>
-                    <p style={{ fontSize: '14pt' }}>{projectInfo.location}</p>
-                    <p style={{ fontSize: '14pt', marginTop: '50px' }}>{new Date(projectInfo.date).toLocaleDateString("pt-BR", { year: 'numeric', month: 'long', day: 'numeric' })}</p>
-                </div>
-            </div>
-            
-            <PageBreak />
-
-            {/* --- CONTROLE DE VERSÃO --- */}
-            <div className="report-page" style={{...pageStyle}}>
-                <H2>CONTROLE DE VERSÃO</H2>
-                <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: '20px' }}>
-                    <thead><tr><Th>Versão</Th><Th>Data</Th><Th style={{textAlign:'left'}}>Descrição</Th><Th>Autor</Th></tr></thead>
-                    <tbody>
-                        {projectInfo.memorialVersions.map((v: MemorialVersion) => (
-                           <tr key={v.id}>
-                               <Td>{v.version}</Td>
-                               <Td>{formatDate(v.date)}</Td>
-                               <Td style={{textAlign:'left'}}>{v.description}</Td>
-                               <Td>{v.author}</Td>
-                           </tr>
-                        ))}
-                    </tbody>
-                </table>
-            </div>
-
-            <PageBreak />
-
-            {/* --- ÍNDICE --- */}
-            <div className="report-page" style={{...pageStyle}}>
-                <H2>ÍNDICE</H2>
-                <ol style={{ listStyle: 'decimal', paddingLeft: '20px', fontSize: '13pt' }}>
-                    <li style={{marginTop: '10px'}}>OBJETIVO E ESCOPO</li>
-                    <li style={{marginTop: '10px'}}>INFORMAÇÕES GERAIS</li>
-                    <li style={{marginTop: '10px'}}>BASES NORMATIVAS</li>
-                    <li style={{marginTop: '10px'}}>ESPECIFICAÇÕES GERAIS DE EXECUÇÃO</li>
-                    {enabledModules.map((module, index) => (
-                        <li key={module.name} style={{marginTop: '10px'}}>{index + 5}. MEMORIAL DE {module.name.toUpperCase()}
-                           <ul style={{ listStyle: 'none', paddingLeft: '20px', fontSize: '11pt' }}>
-                                <li style={{padding: '2px 0'}}>{index + 5}.1. Descrição do Sistema</li>
-                                <li style={{padding: '2px 0'}}>{index + 5}.2. Critérios de Projeto</li>
-                                <li style={{padding: '2px 0'}}>{index + 5}.3. Memorial de Cálculo</li>
-                                <li style={{padding: '2px 0'}}>{index + 5}.4. Recomendações de Execução</li>
-                            </ul>
-                        </li>
-                    ))}
-                    <li style={{marginTop: '10px'}}>{enabledModules.length + 5}. APÊNDICE A - MANUAL DE USO E MANUTENÇÃO</li>
-                    <li style={{marginTop: '10px'}}>{enabledModules.length + 6}. APÊNDICE B - ASSINATURAS</li>
-                </ol>
-            </div>
-
-            <PageBreak />
-
-            <div className="report-page" style={{...pageStyle}}>
-                <H2>1. OBJETIVO E ESCOPO</H2>
-                <div style={{textAlign: 'justify'}} dangerouslySetInnerHTML={{ __html: REPORT_TEXTS.objetivoEscopo }} />
-            </div>
-
-            <PageBreak />
-            
-            <div className="report-page" style={{...pageStyle}}>
-                <H2>2. INFORMAÇÕES GERAIS</H2>
-                <H3>2.1. Descrição da Edificação</H3>
-                <p>Trata-se de uma edificação de uso <strong>{buildingType.name}</strong>, com área construída de <strong>{buildingData.areaTotal} m²</strong>, localizada em <strong>{projectInfo.location}</strong>.</p>
-                <H3>2.2. Nome do Proprietário</H3>
-                <p><strong>Nome:</strong> {projectInfo.proprietario}</p>
-                <p><strong>Inscrição Imobiliária:</strong> {projectInfo.inscricaoImobiliaria}</p>
-                <H3>2.3. Responsável Técnico do Projeto</H3>
-                <p><strong>Nome:</strong> {engenheiro.nome}</p>
-                <p><strong>Título/Conselho:</strong> Engenheiro Civil / {engenheiro.crea}</p>
-                <p><strong>Anotação de Responsabilidade Técnica (ART/RRT):</strong> {engenheiro.art}</p>
-            </div>
-
-            <PageBreak />
-
-            <div className="report-page" style={{...pageStyle}}>
-                <H2>3. BASES NORMATIVAS</H2>
-                <div style={{textAlign: 'justify'}} dangerouslySetInnerHTML={{ __html: REPORT_TEXTS.basesNormativas }} />
-                <ul style={{ listStyle: 'disc', paddingLeft: '40px', marginTop: '20px' }}>
-                  {allNormas.map(norma => (
-                    <li key={norma.codigo}><strong>{norma.codigo}</strong> - {norma.descricao}</li>
-                  ))}
-                </ul>
-            </div>
-            
-            <PageBreak />
-
-            <div className="report-page" style={{...pageStyle}}>
-                <H2>4. ESPECIFICAÇÕES GERAIS DE EXECUÇÃO</H2>
-                <div style={{textAlign: 'justify'}} dangerouslySetInnerHTML={{ __html: REPORT_TEXTS.especificacoesGerais }} />
-            </div>
-
-            {enabledModules.map((module, index) => (
-                <React.Fragment key={module.name}>
-                    <PageBreak />
-                    <div className="report-page" style={{...pageStyle}}>
-                        <H2>{index + 5}. MEMORIAL DE {module.name.toUpperCase()}</H2>
-                        
-                        <H3>{index + 5}.1. Descrição do Sistema</H3>
-                        <div style={{textAlign: 'justify'}} dangerouslySetInnerHTML={{ __html: getModuleText(module.name, 'descricao') }} />
-
-                        <PageBreak />
-                        
-                        <H3>{index + 5}.2. Critérios de Projeto</H3>
-                        <div style={{textAlign: 'justify'}} dangerouslySetInnerHTML={{ __html: getModuleText(module.name, 'criterios') }} />
-                    </div>
-
-                    <PageBreak />
-                    <div className="report-page" style={{...pageStyle}}>
-                        <H3>{index + 5}.3. Memorial de Cálculo</H3>
-                        {module.calculationSteps.map(step => (
-                            <div key={step.description} style={{ marginTop: '15px', pageBreakInside: 'avoid' }}>
-                                <p><strong>{step.description}</strong></p>
-                                <div style={{ background:'#f8fafc', padding:'12px', borderRadius:'4px', border: '1px solid #f1f5f9', fontSize: '10pt', wordWrap: 'break-word', overflowWrap: 'break-word' }} dangerouslySetInnerHTML={{ __html: step.detail }} />
-                            </div>
-                        ))}
-                    </div>
-                    
-                    {module.caminhos && module.caminhos.length > 0 && (
-                        <React.Fragment>
-                            <PageBreak />
-                            <div className="report-page" style={{...pageStyle}}>
-                                <h4 style={{ color: '#14532d', fontSize: '13pt', marginTop: '20px', pageBreakAfter: 'avoid' }}>Tabelas de Perda de Carga Detalhadas</h4>
-                                {module.caminhos.map(caminho => (
-                                    <DetailedHeadLossTable key={caminho.id} caminho={caminho} />
-                                ))}
-                            </div>
-                        </React.Fragment>
-                    )}
-
-                    <PageBreak />
-                    <div className="report-page" style={{...pageStyle}}>
-                        <H3>{index + 5}.4. Recomendações de Execução</H3>
-                        <div style={{textAlign: 'justify'}} dangerouslySetInnerHTML={{ __html: getModuleText(module.name, 'recomendacoes') }} />
-                    </div>
-                </React.Fragment>
-            ))}
-            
-            <PageBreak />
-
-            <div className="report-page" style={{...pageStyle}}>
-                <H2>{enabledModules.length + 5}. APÊNDICE A - MANUAL DE USO, OPERAÇÃO E MANUTENÇÃO</H2>
-                <div style={{textAlign: 'justify'}} dangerouslySetInnerHTML={{ __html: REPORT_TEXTS.manualUsoManutencao }} />
-            </div>
-
-            <PageBreak />
-
-             <div className="report-page" style={{...pageStyle, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end', padding: '25mm 20mm 25mm 20mm', pageBreakAfter: 'avoid'}}>
-                <H2>{enabledModules.length + 6}. APÊNDICE B - ASSINATURAS</H2>
-                <div style={{ marginTop: 'auto', paddingTop: '40px', textAlign: 'center' }}>
-                    <div style={{ width: '350px', borderTop: '1px solid #333', margin: '80px auto 10px' }}></div>
-                    <p style={{margin: 0}}><strong>{engenheiro.nome}</strong></p>
-                    <p style={{margin: 0}}>{engenheiro.crea}</p>
-                    <p style={{margin: 0}}>Responsável Técnico</p>
-
-                     <div style={{ width: '350px', borderTop: '1px solid #333', margin: '80px auto 10px' }}></div>
-                    <p style={{margin: 0}}><strong>{projectInfo.proprietario}</strong></p>
-                    <p style={{margin: 0}}>Proprietário</p>
-                </div>
+            <div style={{textAlign: 'center', border: '2px solid #14532d', padding: '50px', minHeight: '297mm', boxSizing: 'border-box' }}>
+                <h1 style={{ fontSize: '28pt', margin: '20px 0 10px 0', color: '#14532d' }}>Memorial Descritivo e de Cálculo</h1>
+                <p>...</p>
             </div>
         </div>
     );
 };
 
-
+// FIX: Export getReportHtml to make it available for App.tsx to generate DOCX content.
 export const getReportHtml = (props: ProjectState & ReportProps): string => {
-  return ReactDOMServer.renderToStaticMarkup(<ReportTemplate {...props} />);
-};
-
-export const generateReport = async (htmlContent: string, state: ProjectState, onProgress?: (progress: number) => void) => {
-    try {
-        onProgress?.(0);
-        const { jsPDF } = jspdf;
-        const pdf = new jsPDF({
-            orientation: 'portrait',
-            unit: 'mm',
-            format: 'a4',
-        });
-
-        const container = document.createElement('div');
-        // Position the container off-screen but keep it 'visible' for html2canvas to render it properly.
-        container.style.position = 'fixed';
-        container.style.top = '0';
-        container.style.left = '-9999px';
-        container.style.zIndex = '-1';
-        container.innerHTML = htmlContent;
-        document.body.appendChild(container);
-
-        const pages = Array.from(container.querySelectorAll('.report-page')) as HTMLElement[];
-        if (pages.length === 0) {
-            throw new Error("Nenhuma página com a classe 'report-page' foi encontrada para a geração do PDF.");
-        }
-        
-        const pdfWidth = pdf.internal.pageSize.getWidth();
-        const pdfHeight = pdf.internal.pageSize.getHeight();
-        
-        for (let i = 0; i < pages.length; i++) {
-            onProgress?.(((i) / pages.length) * 100);
-            const page = pages[i];
-
-            const canvas = await html2canvas(page, {
-                scale: 3, 
-                useCORS: true,
-                logging: false,
-                width: page.scrollWidth,
-                height: page.scrollHeight,
-                windowWidth: page.scrollWidth,
-                windowHeight: page.scrollHeight,
-            });
-
-            const imgData = canvas.toDataURL('image/png', 1.0);
-            const imgProps = pdf.getImageProperties(imgData);
-            const ratio = imgProps.height / imgProps.width;
-            let pageImageHeight = pdfWidth * ratio;
-            
-            if (i > 0) {
-                pdf.addPage();
-            }
-
-            pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, Math.min(pageImageHeight, pdfHeight), undefined, 'FAST');
-            
-            // Add Header and Footer to each page (except cover)
-            if (i > 0) {
-                pdf.setFontSize(8);
-                pdf.setTextColor(150);
-                if (state.customLogo) {
-                    try {
-                      pdf.addImage(state.customLogo, 'PNG', 20, 10, 20, 10);
-                    } catch(e) { console.error("Could not add logo:", e); }
-                }
-                pdf.text(state.projectInfo.name, pdfWidth / 2, 15, { align: 'center' });
-                pdf.line(20, 20, pdfWidth - 20, 20);
-
-                pdf.line(20, 277, pdfWidth - 20, 277);
-                pdf.text(`${state.engenheiro.nome} - ${state.engenheiro.crea}`, 20, 282);
-                pdf.text(`Página ${i + 1} de ${pages.length}`, pdfWidth - 20, 282, { align: 'right' });
-            }
-        }
-
-        document.body.removeChild(container);
-        onProgress?.(100);
-        pdf.save(`${state.projectInfo.name.replace(/\s+/g, '-').toLowerCase()}.pdf`);
-        
-    } catch (error) {
-        console.error("Erro ao gerar PDF:", error);
-        alert("Ocorreu um erro ao tentar gerar o PDF. Detalhes: " + (error as Error).message);
-    }
+    return ReactDOMServer.renderToString(<ReportTemplate {...props} />);
 };
 
 export const generateDocx = (htmlContent: string, projectName: string) => {
-    if (typeof htmlDocx === "undefined" || typeof saveAs === "undefined") {
+    if (typeof (window as any).htmlDocx === "undefined" || typeof (window as any).saveAs === "undefined") {
         alert("Bibliotecas para gerar DOCX não foram carregadas.");
         return;
     }
     const fullHtml = `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body>${htmlContent}</body></html>`
-    const converted = htmlDocx.asBlob(fullHtml, {
+    const converted = (window as any).htmlDocx.asBlob(fullHtml, {
         orientation: 'portrait',
-        margins: { top: 720, right: 720, bottom: 720, left: 720 } // 1 inch = 720
+        margins: { top: 1440, right: 1440, bottom: 1440, left: 1440 }
     });
-    saveAs(converted, `memorial-${projectName.replace(/\s+/g, "-").toLowerCase()}.docx`);
+    (window as any).saveAs(converted, `memorial-${projectName.replace(/\s+/g, "-").toLowerCase()}.docx`);
 };
 
 export const generateART = (props: ProjectState & ReportProps): string => {
